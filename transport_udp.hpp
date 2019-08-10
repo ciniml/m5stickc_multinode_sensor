@@ -14,6 +14,7 @@ namespace Transport {
 class UDPTransport {
 private:
     int fd;
+    int send_port;
 
 public:
     struct AddressType {
@@ -27,18 +28,41 @@ public:
             return this->address;
         }
     };
-    UDPTransport() : fd(0) {
+
+    UDPTransport(int send_port) : fd(0), send_port(send_port) {
         this->fd = socket(AF_INET, SOCK_DGRAM, 0);
         int dummy;
         ioctl(this->fd, FIONBIO, &dummy);
     }
 
+    void bind(int port) {
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        ::bind(this->fd, (struct sockaddr *)&addr, (::socklen_t)sizeof(addr));
+    }
+
     int send_packet(const AddressType& address, const void* data, std::size_t length) {
-        return sendto(this->fd, data, length, 0, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address));
+        AddressType address_ = address;
+        address_.address.sin_port = htons(this->send_port);
+        int rc = sendto(this->fd, data, length, 0, reinterpret_cast<const struct sockaddr*>(&address_), sizeof(address_));
+        if( rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
+            return 0;
+        }
+        else {
+            return rc;
+        }
     }
     int receive_packet(AddressType& address, void* data, std::size_t length) {
         socklen_t address_len = sizeof(address);
-        return recvfrom(this->fd, data, length, 0, reinterpret_cast<struct sockaddr*>(&address), &address_len);
+        int rc = recvfrom(this->fd, data, length, 0, reinterpret_cast<struct sockaddr*>(&address), &address_len);
+        if( rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
+            return 0;
+        }
+        else {
+            return rc;
+        }
     }
 };
 

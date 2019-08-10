@@ -3,6 +3,9 @@
 
 #include <cstdint>
 #include <array>
+#include <boost/multiprecision/cpp_int.hpp>
+
+namespace mp = boost::multiprecision;
 
 namespace PTP {
 
@@ -22,6 +25,11 @@ struct UInteger16 {
 };
 struct UInteger32 { 
     std::uint8_t raw_value[4];
+    UInteger32() = default;
+    UInteger32(const UInteger32&) = default;
+    UInteger32(std::uint32_t value) {
+        this->set(value);
+    }
     std::uint32_t get() const { return (this->raw_value[0] << 24) | (this->raw_value[1]  << 16) | (this->raw_value[2] << 8) | this->raw_value[3]; }
     void set(std::uint32_t value) { this->raw_value[0] = value >> 24; this->raw_value[1] = value >> 16; this->raw_value[2] = value >> 8; this->raw_value[3] = value; }
     operator std::uint32_t() const { return this->get(); }
@@ -29,6 +37,11 @@ struct UInteger32 {
 };
 struct UInteger48 { 
     std::uint8_t raw_value[6];
+    UInteger48() = default;
+    UInteger48(const UInteger48&) = default;
+    UInteger48(std::uint64_t value) {
+        this->set(value);
+    }
     std::uint64_t get() const { 
         return (static_cast<std::uint64_t>(this->raw_value[0]) << 40) | 
                (static_cast<std::uint64_t>(this->raw_value[1]) << 32) | 
@@ -80,10 +93,86 @@ struct Integer16 {
     operator std::int16_t() const { return this->get(); }
     Integer16& operator=(std::int16_t value) { this->set(value); return *this; }
 };
+struct Integer48 { 
+    std::uint8_t raw_value[6];
+    std::int64_t get() const { 
+        std::uint64_t raw = (static_cast<std::uint64_t>(this->raw_value[0]) << 40) | 
+                            (static_cast<std::uint64_t>(this->raw_value[1]) << 32) | 
+                            (static_cast<std::uint64_t>(this->raw_value[2]) << 24) | 
+                            (static_cast<std::uint64_t>(this->raw_value[3]) << 16) | 
+                            (static_cast<std::uint64_t>(this->raw_value[4]) <<  8) | 
+                            this->raw_value[5]; 
+        return static_cast<std::int64_t>( (raw & 0x800000000000ul) ? (~raw + 1) : raw);
+    }
+    void set(std::int64_t value) { 
+        std::uint64_t v = static_cast<std::uint64_t>(value);
+        this->raw_value[0] = v >> 40; 
+        this->raw_value[1] = v >> 32; 
+        this->raw_value[2] = v >> 24; 
+        this->raw_value[3] = v >> 16; 
+        this->raw_value[4] = v >> 8; 
+        this->raw_value[5] = v; 
+    }
+    operator std::int64_t() const { return this->get(); }
+    Integer48& operator=(std::int64_t value) { this->set(value); return *this; }
+};
 
 struct Timestamp {
     UInteger48 seconds_field;
     UInteger32 nanoseconds_field;
+};
+
+struct TimeDiff {
+    mp::int128_t raw;
+
+    TimeDiff() = default;
+    TimeDiff(const TimeDiff&) = default;
+    TimeDiff(const mp::int128_t& value) : raw(value) {}
+
+    TimeDiff operator-() const { return TimeDiff(-this->raw); }
+    TimeDiff& operator=(const TimeDiff& rhs) { this->raw = rhs.raw; return *this; }
+    TimeDiff operator+(const TimeDiff& rhs) const { return TimeDiff(this->raw + rhs.raw); }
+    TimeDiff operator-(const TimeDiff& rhs) const { return TimeDiff(this->raw - rhs.raw); }
+    TimeDiff operator*(const mp::int128_t& rhs) const { return TimeDiff(this->raw*rhs); }
+    TimeDiff operator*(int64_t rhs) const { return TimeDiff(this->raw*rhs); }
+    TimeDiff operator/(const mp::int128_t& rhs) const { return TimeDiff(this->raw/rhs); }
+    TimeDiff operator/(int64_t rhs) const { return TimeDiff(this->raw/rhs); }
+    TimeDiff operator%(const mp::int128_t& rhs) const { return TimeDiff(this->raw%rhs); }
+    TimeDiff operator%(int64_t rhs) const { return TimeDiff(this->raw%rhs); }
+    bool operator<(const TimeDiff& rhs) const { return this->raw < rhs.raw; }
+    bool operator==(const TimeDiff& rhs) const { return this->raw == rhs.raw; }
+    bool operator>(const TimeDiff& rhs) const { return this->raw > rhs.raw; }
+};
+
+struct Timestamp128 {
+    mp::int128_t raw;
+    
+    Timestamp128() = default;
+    Timestamp128(const mp::int128_t& value) : raw(value) {}
+    Timestamp128(const Timestamp timestamp) {
+        mp::int128_t seconds = timestamp.seconds_field.get();
+        mp::int128_t nanoseconds = timestamp.nanoseconds_field.get();
+        this->raw = seconds*1000000000ul + nanoseconds;
+    }
+
+    operator Timestamp() {
+        return Timestamp {
+            UInteger48(static_cast<uint64_t>(this->raw / 1000000000ul)),
+            UInteger32(static_cast<uint64_t>(this->raw % 1000000000ul))
+        };
+    }
+
+    Timestamp128& operator=(const Timestamp128& rhs) {
+        this->raw = rhs.raw;
+        return *this;
+    }
+
+    Timestamp128 operator+(const TimeDiff& rhs) {
+        return Timestamp128(this->raw + rhs.raw);
+    }
+    TimeDiff operator-(const Timestamp128& rhs) {
+        return TimeDiff(this->raw - rhs.raw);
+    }
 };
 
 struct ClockIdentity {
@@ -211,7 +300,13 @@ struct DelayRespMessage {
     PortIdentity requesting_port_identity;
 };
 
-template<typename Transport, typename ClockSource, std::size_t MaxSlaves>
+
+struct NullLogger {
+    template <typename... Args> static void info(const char* fmt, Args... args) {}
+    template <typename... Args> static void error(const char* fmt, Args... args) {}
+};
+
+template<typename Transport, typename ClockSource, std::size_t MaxSlaves, typename Logger=NullLogger>
 class MasterClock {
 public:
     typedef typename Transport::AddressType AddressType;
@@ -226,7 +321,7 @@ private:
     };
     struct SlaveContext {
         AddressType address;
-        Timestamp last_sync_time;
+        Timestamp128 last_sync_time;
         SlaveState state;
         std::uint16_t sequence_id;
     };
@@ -247,8 +342,7 @@ public:
         if( number_of_slaves < MaxSlaves ) {
             auto& slave = this->slaves[this->number_of_slaves++];
             slave.address = address;
-            slave.last_sync_time.seconds_field = 0;
-            slave.last_sync_time.nanoseconds_field = 0;
+            slave.last_sync_time = static_cast<Timestamp128>(0);
             slave.state = SlaveState::NotSyncing;
             slave.sequence_id = 0;
         }
@@ -258,11 +352,12 @@ public:
             DelayReqMessage response;
             AddressType address;
             int rc = this->transport.receive_packet(address, &response, sizeof(response));
-            if( rc == sizeof(response) ) {
+            if( rc == sizeof(response) && response.header.transport_specific_message_type.message_type_const() == MessageType::Delay_Req) {
+                Logger::info("[MASTER] Receive Delay_Req\n");
                 auto slave = this->get_slave(address);
-                if( slave != nullptr ) {
+                if( slave != nullptr && slave->state == SlaveState::Syncing ) {
                     DelayRespMessage message;
-                    message.header.transport_specific_message_type.message_type() = static_cast<std::uint8_t>(MessageType::Sync);
+                    message.header.transport_specific_message_type.message_type() = static_cast<std::uint8_t>(MessageType::Delay_Resp);
                     message.header.transport_specific_message_type.transport_specific() = 0;
                     message.header.reserved_version_ptp.version_ptp() = 1;
                     message.header.reserved_version_ptp.reserved() = 0;
@@ -272,8 +367,9 @@ public:
                     message.header.sequence_id = slave->sequence_id++;
                     message.receive_timestamp = this->clock_source.now();
                     this->transport.send_packet(address, &message, sizeof(message));
-
+                    Logger::info("[MASTER] Send Delay_Resp\n");
                     slave->state = SlaveState::Synced;
+                    slave->last_sync_time = this->clock_source.now();
                 }
             }
             else {
@@ -283,11 +379,21 @@ public:
     }
     void update() {
         this->process_response();
-
         for(std::size_t i = 0; i < this->number_of_slaves; ++i) {
             auto& slave = this->slaves[i];
             switch(slave.state) {
-            case SlaveState::NotSyncing:
+            case SlaveState::Synced:
+                auto duration = this->clock_source.now() - slave.last_sync_time;
+                if( duration > TimeDiff(1000000000ul) ) {
+                    slave.state = SlaveState::NotSyncing;
+                }
+                break;
+            }
+        }
+        for(std::size_t i = 0; i < this->number_of_slaves; ++i) {
+            auto& slave = this->slaves[i];
+            switch(slave.state) {
+            case SlaveState::NotSyncing: {
                 SyncMessage message;
                 message.header.transport_specific_message_type.message_type() = static_cast<std::uint8_t>(MessageType::Sync);
                 message.header.transport_specific_message_type.transport_specific() = 0;
@@ -297,16 +403,138 @@ public:
                 message.header.domain_number = 0;
                 message.header.flag_field.flags = FlagField::UnicastFlag;
                 message.header.sequence_id = slave.sequence_id++;
-                message.origin_timestamp = this->clock_source.now();
+                auto timestamp = this->clock_source.now();
+                message.origin_timestamp = timestamp;
                 if( this->transport.send_packet(slave.address, &message, sizeof(message)) ) {
-                    DelayReqMessage response;
+                    Logger::info("[MASTER] Send sync\n");
                     slave.state = SlaveState::Syncing;
-
+                    slave.last_sync_time = timestamp;
                     this->process_response();
                 }
                 break;
             }
+            case SlaveState::Syncing: {
+                if( this->clock_source.now() - slave.last_sync_time > TimeDiff(1000000000ul) ) {
+                    // Timed out
+                    slave.state = SlaveState::NotSyncing;
+                }
+                break;
+            }
+            }
         }
+    }
+};
+
+
+template<typename Transport, typename UpdatableClockSource, typename Logger=NullLogger>
+class SlaveClock {
+public:
+    typedef typename Transport::AddressType AddressType;
+private:
+    Transport& transport;
+    UpdatableClockSource& clock_source;
+    enum class SlaveState {
+        Idle,
+        SyncReceived,
+        DelayReqSent,
+    };
+
+    SlaveState state;
+    Timestamp128 timeSyncSent;
+    Timestamp128 timeSyncReceived;
+    Timestamp128 timeDelayReqSent;
+    Timestamp128 timeDelayReqReceived;
+    AddressType master_address;
+
+
+    bool receive_sync() {
+        AddressType address;
+        SyncMessage message;
+        int rc = this->transport.receive_packet(address, &message, sizeof(message));
+        if( rc == sizeof(message) && message.header.transport_specific_message_type.message_type_const() == MessageType::Sync ) {
+            this->timeSyncReceived = this->clock_source.now();
+            this->timeSyncSent = message.origin_timestamp;
+            this->master_address = address;
+            this->state = SlaveState::SyncReceived;
+            Logger::info("[SLAVE] Receive sync\n");
+            return true;
+        }
+        else if( rc == 0 ) {
+            return false;
+        }
+        else {
+            Logger::error("[SLAVE] failed to receive packet: %d\n", errno);
+            return false;
+        }
+    }
+    bool send_delay_req() {
+        DelayReqMessage message;
+        message.header.transport_specific_message_type.message_type() = static_cast<std::uint8_t>(MessageType::Delay_Req);
+        message.header.transport_specific_message_type.transport_specific() = 0;
+        message.header.reserved_version_ptp.version_ptp() = 1;
+        message.header.reserved_version_ptp.reserved() = 0;
+        message.header.message_length = sizeof(message) - sizeof(MessageHeader);
+        message.header.domain_number = 0;
+        message.header.flag_field.flags = FlagField::UnicastFlag;
+        message.header.sequence_id = 0;
+        Timestamp128 timeDelayReqSent = this->clock_source.now();
+        message.origin_timestamp = timeDelayReqSent;
+        if( this->transport.send_packet(this->master_address, &message, sizeof(message)) ) {
+            this->state = SlaveState::DelayReqSent;
+            this->timeDelayReqSent = timeDelayReqSent;
+            Logger::info("[SLAVE] Send Delay_Req\n");
+            return true;
+        }
+        return false;
+    }
+    bool receive_delay_resp() {
+        AddressType address;
+        DelayRespMessage message;
+        int rc = this->transport.receive_packet(address, &message, sizeof(message));
+        if( rc == sizeof(message) && message.header.transport_specific_message_type.message_type_const() == MessageType::Delay_Resp ) {
+            this->timeDelayReqReceived = message.receive_timestamp;
+            auto offset = ((this->timeSyncReceived - this->timeSyncSent) - (this->timeDelayReqReceived - this->timeDelayReqSent)) / 2;
+            Logger::info("[SLAVE] Receive Delay_Resp\n", offset.raw.str().c_str());
+            Logger::info("[SLAVE] Sync     Sent: %s\n", this->timeSyncSent.raw.str().c_str());
+            Logger::info("[SLAVE] Sync     Rcvd: %s\n", this->timeSyncReceived.raw.str().c_str());
+            Logger::info("[SLAVE] DelayReq Sent: %s\n", this->timeDelayReqSent.raw.str().c_str());
+            Logger::info("[SLAVE] DelayReq Rcvd: %s\n", this->timeDelayReqReceived.raw.str().c_str());
+            Logger::info("[SLAVE] Offset: %s\n", offset.raw.str().c_str());
+
+            this->clock_source.add_offset(-offset);
+            this->state = SlaveState::Idle;
+            
+            return false;
+        }
+        else {
+            return false;
+        }
+    }
+
+public:
+    SlaveClock(Transport& transport, UpdatableClockSource& clock_source) : transport(transport), clock_source(clock_source), state(SlaveState::Idle) {}
+    
+    bool update() {
+        bool process_next = true;
+
+        while(process_next) {
+            switch(this->state) {
+            case SlaveState::Idle:
+                process_next = this->receive_sync();
+                break;   
+            case SlaveState::SyncReceived:
+                process_next = this->send_delay_req();
+                break;
+            case SlaveState::DelayReqSent:
+                process_next = this->receive_delay_resp();
+                if( this->state == SlaveState::Idle && !process_next ) {
+                    return true;
+                }
+                break;
+            }
+        }
+
+        return false;
     }
 };
 

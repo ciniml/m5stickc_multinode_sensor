@@ -1,12 +1,19 @@
 .PHONY: all clean
 
-CXXFLAGS := -O0
+BOOSTDIR ?= $(HOME)/boost_1_70_0
+
+CXXFLAGS := -O0 -I$(BOOSTDIR) -g
 LDFLAGS :=
 
-%.cpp: %.o
-	g++ $(CXXFLAGS) -c -o %@ %<
+all: master slave
+
+%.o: %.cpp
+	g++ $(CXXFLAGS) -c -o $@ $<
 
 master: main_unix_master.o
+	g++ $(LDFLAGS) $^ -o $@
+
+slave: main_unix_slave.o
 	g++ $(LDFLAGS) $^ -o $@
 
 clean:
