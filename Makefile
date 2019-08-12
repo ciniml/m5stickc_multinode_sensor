@@ -2,7 +2,7 @@
 
 BOOSTDIR ?= $(HOME)/boost_1_70_0
 
-CXXFLAGS := -O0 -I$(BOOSTDIR) -g
+CXXFLAGS := -O0 -I$(BOOSTDIR) -g -std=c++11
 LDFLAGS :=
 
 all: master slave
