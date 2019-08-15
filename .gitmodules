@@ -1,3 +1,12 @@
 [submodule "esp-idf"]
 	path = esp-idf
 	url = https://github.com/espressif/esp-idf
+[submodule "components/arduino-esp32"]
+	path = components/arduino-esp32
+	url = https://github.com/espressif/arduino-esp32
+[submodule "components/m5stickc"]
+	path = components/m5stickc
+	url = https://github.com/m5stack/m5stickc
+[submodule "components/arduino"]
+	path = components/arduino
+	url = https://github.com/espressif/arduino-esp32
