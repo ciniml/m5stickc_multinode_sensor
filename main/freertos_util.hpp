@@ -124,13 +124,13 @@ namespace freertos
 			return this->get_free_spaces() != 0;
 		}
 
-		bool send(const TItem& item)
+		bool send(const TItem& item, TickType_t wait_ticks = portMAX_DELAY)
 		{
-			return xQueueSend(this->handle.get(), &item, portMAX_DELAY) == pdTRUE;
+			return xQueueSend(this->handle.get(), &item, wait_ticks) == pdTRUE;
 		}
-		bool receive(TItem& received_item)
+		bool receive(TItem& received_item, TickType_t wait_ticks = portMAX_DELAY)
 		{
-			return xQueueReceive(this->handle.get(), &received_item, portMAX_DELAY) == pdTRUE;
+			return xQueueReceive(this->handle.get(), &received_item, wait_ticks) == pdTRUE;
 		}
 	};
 

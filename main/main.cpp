@@ -15,6 +15,8 @@
 #include "freertos_util.hpp"
 
 
+// Result -------------------------
+
 template<typename T>
 struct Success
 {
@@ -99,7 +101,56 @@ template<typename T, typename E, E SuccessCode> Success<T> success(Result<T, E, 
 template<typename E> Failure<E> failure(const E& error_code) { return Failure<E>(error_code); }
 template<typename T, typename E, E SuccessCode> Failure<E> failure(const Result<T, E, SuccessCode>& failure_result) { return Failure<E>(failure_result.error_code); }
 
-static AXP192 axp;
+// RingBuffer
+
+template<typename TItem, std::size_t Capacity>
+class RingBuffer
+{
+private:
+    typedef RingBuffer<TItem, Capacity> SelfType;
+    static constexpr std::size_t Mask = Capacity - 1;
+    static constexpr std::size_t AdvanceMask = (Capacity<<1) - 1;
+    static_assert((Mask & Capacity) == 0, "Capacity must be power of two.");
+
+    std::array<TItem, Capacity> buffer;
+    std::size_t read_index;
+    std::size_t write_index;
+
+public:
+    RingBuffer() : read_index(0), write_index(0) {}
+
+    bool is_empty() const { return this->read_index == this->write_index; }
+    bool is_full() const { return (this->read_index ^ this->write_index) == Capacity; }
+
+    bool queue(const TItem& item)
+    {
+        if( this->is_full() ) {
+            return false;
+        }
+        this->buffer[this->write_index & Mask] = item;
+        this->write_index = (this->write_index + 1) & AdvanceMask;
+        return true;
+    }
+
+    Result<TItem, bool> dequeue()
+    {
+        if( this->is_empty() ) {
+            return failure(false);
+        }
+
+        auto value = success<TItem>(this->buffer[this->read_index & Mask]);
+        this->read_index = (this->read_index + 1) & AdvanceMask;
+        return std::move(value);
+    }
+
+    void reset() 
+    {
+        while(!this->is_empty()) {
+            this->dequeue();
+        }
+    }
+};
+
 static M5Display lcd;
 
 static freertos::Mutex i2c_mutex;
@@ -406,6 +457,36 @@ public:
 
         return success();
     }
+
+    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t device_address, std::uint8_t register_address, TickType_t wait_ticks)
+    {
+        I2CCommandLink commands;
+        if( !commands ) {
+            return failure(ESP_ERR_NO_MEM);
+        }
+        std::uint8_t buffer;
+        auto result = commands.read_register(device_address, register_address, &buffer, 1, i2c_ack_type_t::I2C_MASTER_LAST_NACK);
+        if( !result ) return failure(result);
+
+        result = this->execute(commands, wait_ticks);
+        if( !result ) return failure(result);
+
+        return success<std::uint8_t>(buffer);
+    }
+    Result<void, esp_err_t> write_single_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks)
+    {
+        I2CCommandLink commands;
+        if( !commands ) {
+            return failure(ESP_ERR_NO_MEM);
+        }
+        auto result = commands.write_register(device_address, register_address, &value, 1);
+        if( !result ) return failure(result);
+
+        result = this->execute(commands, wait_ticks);
+        if( !result ) return failure(result);
+
+        return success();
+    }
 };
 
 
@@ -429,10 +510,40 @@ struct Vector3
     TElement x_const() const { return this->items.at(0); }
     TElement y_const() const { return this->items.at(1); }
     TElement z_const() const { return this->items.at(2); }
+
+    Vector3<TElement>& operator+=(const Vector3& rhs) {
+        for(std::size_t i = 0; i < this->items.size(); i++) { this->items[i] += rhs.items[i]; }
+        return *this;
+    }
+    Vector3<TElement>& operator-=(const Vector3& rhs) {
+        for(std::size_t i = 0; i < this->items.size(); i++) { this->items[i] -= rhs.items[i]; }
+        return *this;
+    }
+    Vector3<TElement>& operator*=(TElement rhs) {
+        for(std::size_t i = 0; i < this->items.size(); i++) { this->items[i] *= rhs; }
+        return *this;
+    }
+    Vector3<TElement>& operator/=(TElement rhs) {
+        for(std::size_t i = 0; i < this->items.size(); i++) { this->items[i] /= rhs; }
+        return *this;
+    }
+    
+    template<typename OtherElement>
+    Vector3<OtherElement> operator*(OtherElement rhs) {
+        return Vector3<OtherElement>(this->items[0] * rhs,
+                                     this->items[1] * rhs,
+                                     this->items[2] * rhs);
+    }
+    template<typename OtherElement>
+    Vector3<OtherElement> operator/(OtherElement rhs) {
+        return Vector3<OtherElement>(this->items[0] / rhs,
+                                     this->items[1] / rhs,
+                                     this->items[2] / rhs);
+    }
 };
 
 typedef Vector3<float> Vector3F;
-
+typedef Vector3<int16_t> Vector3I16;
 
 class IMU
 {
@@ -440,21 +551,23 @@ private:
     I2CMaster& i2c;
     std::uint8_t address;
     
-    Vector3F acceleration;
-    Vector3F gyro;
+    Vector3I16 acceleration_offset;
+    
+    RingBuffer<Vector3I16, 64> acceleration_queue;
+    RingBuffer<Vector3I16, 128> angular_velocity_queue;
 
-    static constexpr std::uint8_t SH200I_REG_CHIP_ID = 0x30;
-    static constexpr std::uint8_t SH200I_REG_ACC_CONFIG = 0x0E;
-    static constexpr std::uint8_t SH200I_REG_GYRO_CONFIG = 0x0F;
-    static constexpr std::uint8_t SH200I_REG_GYRO_CONFIG_1 = 0x11;
-    static constexpr std::uint8_t SH200I_REG_FIFO_CONFIG = 0x12;
-    static constexpr std::uint8_t SH200I_REG_ACC_DATA_FORMAT = 0x16;
-    static constexpr std::uint8_t SH200I_REG_GYRO_RANGE = 0x2B;
-    static constexpr std::uint8_t SH200I_REG_ACC_FIFO_STATUS = 0x2E;
-    static constexpr std::uint8_t SH200I_REG_GYRO_FIFO_STATUS = 0x2F;
-    static constexpr std::uint8_t SH200I_REG_ADC_RESET = 0xC2;
-    static constexpr std::uint8_t SH200I_REG_PLL_RESET = 0xBA;
-    static constexpr std::uint8_t SH200I_CHIP_ID = 0x18;
+    static constexpr std::uint8_t SH200Q_REG_CHIP_ID = 0x30;
+    static constexpr std::uint8_t SH200Q_REG_ACC_CONFIG = 0x0E;
+    static constexpr std::uint8_t SH200Q_REG_GYRO_CONFIG = 0x0F;
+    static constexpr std::uint8_t SH200Q_REG_GYRO_CONFIG_1 = 0x11;
+    static constexpr std::uint8_t SH200Q_REG_FIFO_CONFIG = 0x12;
+    static constexpr std::uint8_t SH200Q_REG_ACC_DATA_FORMAT = 0x16;
+    static constexpr std::uint8_t SH200Q_REG_GYRO_RANGE = 0x2B;
+    static constexpr std::uint8_t SH200Q_REG_ACC_FIFO_STATUS = 0x2E;
+    static constexpr std::uint8_t SH200Q_REG_GYRO_FIFO_STATUS = 0x2F;
+    static constexpr std::uint8_t SH200Q_REG_ADC_RESET = 0xC2;
+    static constexpr std::uint8_t SH200Q_REG_PLL_RESET = 0xBA;
+    static constexpr std::uint8_t SH200Q_CHIP_ID = 0x18;
 
     static constexpr TickType_t DEFAULT_REG_TIMEOUT = pdMS_TO_TICKS(10);
 
@@ -462,38 +575,17 @@ private:
     static constexpr float GYRO_RESOLUTION = 2000.0/32768.0;
 
     #define TAG_IMU "IMU"
-public:
-    IMU(I2CMaster& i2c, std::uint8_t address) : i2c(i2c), address(address) {}
 
     Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
     {
-        I2CCommandLink commands;
-        if( !commands ) {
-            return failure(ESP_ERR_NO_MEM);
-        }
-        std::uint8_t buffer;
-        auto result = commands.read_register(this->address, register_address, &buffer, 1, i2c_ack_type_t::I2C_MASTER_LAST_NACK);
-        if( !result ) return failure(result);
-
-        result = this->i2c.execute(commands, wait_ticks);
-        if( !result ) return failure(result);
-
-        return success<std::uint8_t>(buffer);
+        return this->i2c.read_single_register(this->address, register_address, wait_ticks);
     }
     Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
     {
-        I2CCommandLink commands;
-        if( !commands ) {
-            return failure(ESP_ERR_NO_MEM);
-        }
-        auto result = commands.write_register(this->address, register_address, &value, 1);
-        if( !result ) return failure(result);
-
-        result = this->i2c.execute(commands, wait_ticks);
-        if( !result ) return failure(result);
-
-        return success();
+        return this->i2c.write_single_register(this->address, register_address, value, wait_ticks);
     }
+public:
+    IMU(I2CMaster& i2c, std::uint8_t address) : i2c(i2c), address(address), acceleration_offset(0, 0, 0) {}
 
     Result<void, esp_err_t> reset()
     {
@@ -504,27 +596,27 @@ public:
 
         // Check chip ID
         ESP_LOGI(TAG_IMU, "Checking chip id...");
-        auto chip_id = this->read_single_register(SH200I_REG_CHIP_ID);
+        auto chip_id = this->read_single_register(SH200Q_REG_CHIP_ID);
         if( !chip_id ) return failure(chip_id);
         ESP_LOGI(TAG_IMU, "Chip ID: %02x", chip_id.value);
-        if( chip_id.value != SH200I_CHIP_ID ) {
+        if( chip_id.value != SH200Q_CHIP_ID ) {
             return failure(ESP_ERR_INVALID_RESPONSE);
         }
 
         ESP_LOGI(TAG_IMU, "Configuring registers...");
         // Configure registers
         {
-            auto result = this->write_single_register(SH200I_REG_ACC_CONFIG, 0x11); // HPF enabled, internal clock, ODR=256Hz, filter enabled
+            auto result = this->write_single_register(SH200Q_REG_ACC_CONFIG, 0x91); // HPF disabled, internal clock, ODR=256Hz, filter enabled
             if( !result ) return failure(result);
-            result = this->write_single_register(SH200I_REG_GYRO_CONFIG, 0x03); // HPF enabled, ODR=500Hz, filter enabled
+            result = this->write_single_register(SH200Q_REG_GYRO_CONFIG, 0x03); // HPF enabled, ODR=500Hz, filter enabled
             if( !result ) return failure(result);
-            result = this->write_single_register(SH200I_REG_GYRO_CONFIG_1, 0x13);   // data from HPF, DLPF=3
+            result = this->write_single_register(SH200Q_REG_GYRO_CONFIG_1, 0x13);   // data from HPF, DLPF=3
             if( !result ) return failure(result);
-            result = this->write_single_register(SH200I_REG_FIFO_CONFIG, 0x10); // Stream mode
+            result = this->write_single_register(SH200Q_REG_FIFO_CONFIG, 0x80); // Stream mode
             if( !result ) return failure(result);
-            result = this->write_single_register(SH200I_REG_ACC_DATA_FORMAT, 0x01); // Acc full scale = 8[G]
+            result = this->write_single_register(SH200Q_REG_ACC_DATA_FORMAT, 0x01); // Acc full scale = 8[G]
             if( !result ) return failure(result);
-            result = this->write_single_register(SH200I_REG_GYRO_RANGE, 0x01);  // Gyro full scale = 1000[DPS]
+            result = this->write_single_register(SH200Q_REG_GYRO_RANGE, 0x01);  // Gyro full scale = 1000[DPS]
             if( !result ) return failure(result);
         }
         
@@ -532,26 +624,26 @@ public:
 
         // Reset PLL
         {
-            auto reg_value = this->read_single_register(SH200I_REG_PLL_RESET);
+            auto reg_value = this->read_single_register(SH200Q_REG_PLL_RESET);
             if( !reg_value ) return failure(reg_value);
-            auto write_result = this->write_single_register(SH200I_REG_PLL_RESET, reg_value.value & ~0x01);
+            auto write_result = this->write_single_register(SH200Q_REG_PLL_RESET, reg_value.value & ~0x01);
             if( !write_result ) return failure(write_result);
         }
 
         // Reset ADC
         {
-            auto reg_value = this->read_single_register(SH200I_REG_ADC_RESET);
+            auto reg_value = this->read_single_register(SH200Q_REG_ADC_RESET);
             if( !reg_value ) return failure(reg_value);
-            auto write_result = this->write_single_register(SH200I_REG_ADC_RESET, reg_value.value | 0x10);
+            auto write_result = this->write_single_register(SH200Q_REG_ADC_RESET, reg_value.value | 0x10);
             if( !write_result ) return failure(write_result);
-            write_result = this->write_single_register(SH200I_REG_ADC_RESET, reg_value.value & ~0x10);
+            write_result = this->write_single_register(SH200Q_REG_ADC_RESET, reg_value.value & ~0x10);
             if( !write_result ) return failure(write_result);
         }   
 
         ESP_LOGI(TAG_IMU, "Initialized");
 
-        this->acceleration = Vector3F(0, 0, 0);
-        this->gyro = Vector3F(0, 0, 0);
+        this->acceleration_queue.reset();
+        this->angular_velocity_queue.reset();
 
         return success();
     }
@@ -565,56 +657,92 @@ public:
             if( !commands ) {
                 return failure(ESP_ERR_NO_MEM);
             }
-            auto result = commands.read_register(this->address, SH200I_REG_ACC_FIFO_STATUS, fifo_status, 2, i2c_ack_type_t::I2C_MASTER_LAST_NACK)
+            auto result = commands.read_register(this->address, SH200Q_REG_ACC_FIFO_STATUS, fifo_status, 2, i2c_ack_type_t::I2C_MASTER_LAST_NACK)
                 .then([&commands, this](){ return this->i2c.execute(commands, DEFAULT_REG_TIMEOUT); });
             if( !result ) {
                 return failure(result);
             }
         }
+        std::uint8_t acc_count = fifo_status[0] & 0x3f;;
+        std::uint8_t gyro_count = fifo_status[1] & 0x3f;
+        ESP_LOGI(TAG_IMU, "FIFO status: %02x, %02x", acc_count, gyro_count);
 
-        I2CCommandLink commands;
-        if( !commands ) {
-            return failure(ESP_ERR_NO_MEM);
-        }
+        // Read acc/gyro sensor data.
         std::uint8_t buffer[2*6*32];
-        // std::uint8_t acc_remaining = fifo_status[0] & 0x3f;
-        // std::uint8_t gyro_remaining = fifo_status[1] & 0x3f;
-        // std::uint8_t* buffer_ptr = buffer;
-        // while(acc_remaining > 0 && gyro_remaining > 0) {
-        //     std::uint8_t register_address = acc_remaining > 0 ? 0x00 : 0x06;
-        //     std::uint8_t read_length = (acc_remaining > 0 ? 6 : 0) + (gyro_remaining > 0 ? 6 : 0);
 
-        //     auto result = commands.read_register(this->address, register_address, buffer_ptr, read_length, i2c_ack_type_t::I2C_MASTER_LAST_NACK);
-        //     if( !result ) {
-        //         return failure(result);
-        //     }
+        {
+            std::uint8_t acc_remaining  = acc_count;
+            std::uint8_t gyro_remaining = gyro_count;
 
-        //     buffer_ptr += read_length;
-        //     acc_remaining = acc_remaining > 0 ? acc_remaining - 1 : 0;
-        //     gyro_remaining = gyro_remaining > 0 ? gyro_remaining - 1 : 0;
-        // }
-        
-        auto result = commands.read_register(this->address, 0, buffer, sizeof(buffer), i2c_ack_type_t::I2C_MASTER_LAST_NACK)
-            .then([&commands, this](){ return this->i2c.execute(commands, DEFAULT_REG_TIMEOUT); });
-        if( !result ) {
-            this->acceleration = Vector3F(0, 0, 0);
-            this->gyro = Vector3F(0, 0, 0);
-            return failure(result);
+            std::uint8_t* buffer_ptr = buffer;
+            while(acc_remaining > 0 && gyro_remaining > 0) {
+                I2CCommandLink commands;
+                if( !commands ) {
+                    return failure(ESP_ERR_NO_MEM);
+                }
+                std::uint8_t register_address = acc_remaining > 0 ? 0x00 : 0x06;
+                std::uint8_t read_length = (acc_remaining > 0 ? 6 : 0) + (gyro_remaining > 0 ? 6 : 0);
+
+                auto result = commands.read_register(this->address, register_address, buffer_ptr, read_length, i2c_ack_type_t::I2C_MASTER_LAST_NACK)
+                    .then([&commands, this]() { return this->i2c.execute(commands, DEFAULT_REG_TIMEOUT); });
+                if( !result ) {
+                    return failure(result);
+                }
+
+                buffer_ptr += read_length;
+                acc_remaining = acc_remaining > 0 ? acc_remaining - 1 : 0;
+                gyro_remaining = gyro_remaining > 0 ? gyro_remaining - 1 : 0;
+            }
         }
 
-        this->acceleration = Vector3F(
-            static_cast<int16_t>(buffer[0] | (static_cast<uint16_t>(buffer[1]) << 8)) * ACCELEROMETER_RESOLUTION,
-            static_cast<int16_t>(buffer[2] | (static_cast<uint16_t>(buffer[3]) << 8)) * ACCELEROMETER_RESOLUTION,
-            static_cast<int16_t>(buffer[4] | (static_cast<uint16_t>(buffer[5]) << 8)) * ACCELEROMETER_RESOLUTION);
-        this->gyro = Vector3F(
-            static_cast<int16_t>(buffer[6+0] | (static_cast<uint16_t>(buffer[6+1]) << 8)) * GYRO_RESOLUTION,
-            static_cast<int16_t>(buffer[6+2] | (static_cast<uint16_t>(buffer[6+3]) << 8)) * GYRO_RESOLUTION,
-            static_cast<int16_t>(buffer[6+4] | (static_cast<uint16_t>(buffer[6+5]) << 8)) * GYRO_RESOLUTION);
+        // Parse contents of the buffer and put them into queues.
+        {
+            std::uint8_t acc_remaining  = acc_count;
+            std::uint8_t gyro_remaining = gyro_count;
+
+            std::uint8_t* buffer_ptr = buffer;
+            while(acc_remaining > 0 && gyro_remaining > 0) {
+                if( acc_remaining > 0 ) {
+                    auto acceleration = Vector3I16(
+                        static_cast<int16_t>(buffer_ptr[0] | (static_cast<uint16_t>(buffer_ptr[1]) << 8)),
+                        static_cast<int16_t>(buffer_ptr[2] | (static_cast<uint16_t>(buffer_ptr[3]) << 8)),
+                        static_cast<int16_t>(buffer_ptr[4] | (static_cast<uint16_t>(buffer_ptr[5]) << 8)));
+                    acceleration += this->acceleration_offset;
+                    this->acceleration_queue.queue(acceleration);
+                    buffer_ptr += 6;
+                    acc_remaining--;   
+                }
+                if( gyro_remaining > 0 ) {
+                    auto gyro = Vector3I16(
+                        static_cast<int16_t>(buffer_ptr[0] | (static_cast<uint16_t>(buffer_ptr[1]) << 8)),
+                        static_cast<int16_t>(buffer_ptr[2] | (static_cast<uint16_t>(buffer_ptr[3]) << 8)),
+                        static_cast<int16_t>(buffer_ptr[4] | (static_cast<uint16_t>(buffer_ptr[5]) << 8)));
+                    this->angular_velocity_queue.queue(gyro);
+                    buffer_ptr += 6;
+                    gyro_remaining--;
+                }
+            }
+        }
         return success();
     }
 
-    Vector3F get_acceleration() const { return this->acceleration; }
-    Vector3F get_gyro() const { return this->gyro; }
+    Result<Vector3F, bool> get_acceleration()
+    {
+        auto result = this->acceleration_queue.dequeue();
+        if( !result ) {
+            return failure(false);
+        }
+        return success<Vector3F>(result.value * ACCELEROMETER_RESOLUTION);
+    }
+
+    Result<Vector3F, bool> get_angular_velocity()
+    {
+        auto result = this->angular_velocity_queue.dequeue();
+        if( !result ) {
+            return failure(false);
+        }
+        return success<Vector3F>(result.value * GYRO_RESOLUTION);
+    }
 };
 
 struct IMUData
@@ -628,7 +756,7 @@ static I2CMaster i2c(I2C_NUM_1);
 
 static freertos::WaitQueue<IMUData, 10> imu_queue;
 static void imu_task_proc();
-static StaticTask<4096, decltype(&imu_task_proc)> imu_task(&imu_task_proc);
+static StaticTask<8192, decltype(&imu_task_proc)> imu_task(&imu_task_proc);
 #define TAG_IMU "IMU"
 static void imu_task_proc() 
 {
@@ -644,14 +772,34 @@ static void imu_task_proc()
     }
     auto task = Task::current();
     while( Task::notify_wait(0, 1, portMAX_DELAY).is_success ) {
-        ESP_LOGI(TAG_IMU, "IMU sensor measurement begin");
+        ESP_LOGV(TAG_IMU, "IMU sensor measurement begin");
         IMUData imu_data;
+        imu_data.acc = Vector3F(0, 0, 0);
+        imu_data.gyro = Vector3F(0, 0, 0);
+        int acc_count = 0;
+        int gyro_count = 0;
+
         // Read IMU sensor data via I2C
         auto result = imu.update();
         if( result ) {
-            imu_data.acc = imu.get_acceleration();
-            imu_data.gyro = imu.get_gyro();
-            ESP_LOGI(TAG_IMU, "IMU sensor measurement end. acc=%f,%f,%f gyro=%f,%f,%f"
+            while(auto acc = imu.get_acceleration()) {
+                imu_data.acc += acc.value;
+                acc_count++;
+            }
+            while(auto gyro = imu.get_angular_velocity()) {
+                imu_data.gyro += gyro.value;
+                gyro_count++;
+            }
+            if( acc_count > 0 ) {
+                imu_data.acc /= acc_count;
+            }
+            if( gyro_count > 0 ) {
+                imu_data.gyro /= gyro_count;
+            }
+
+            ESP_LOGV(TAG_IMU, "IMU sensor measurement end. acc_count=%d, gyro_count=%d acc=%f,%f,%f gyro=%f,%f,%f"
+                , acc_count
+                , gyro_count
                 , imu_data.acc.x_const()
                 , imu_data.acc.y_const()
                 , imu_data.acc.z_const()
@@ -660,6 +808,9 @@ static void imu_task_proc()
                 , imu_data.gyro.z_const()
             );
             imu_queue.send(imu_data);
+        }
+        else {
+            ESP_LOGE(TAG_IMU, "IMU update failed - %x", result.error_code);
         }
     }
 }
@@ -674,12 +825,84 @@ static void imu_timer_proc()
     }
 }
 
+
+class PMU
+{
+private:
+    I2CMaster& i2c;
+    std::uint8_t address;
+    
+    static constexpr std::uint8_t AXP192_REG_EXTEN_DCDC2_OUTPUT_CONFIG = 0x10;
+    static constexpr std::uint8_t AXP192_REG_LDO2_LDO3_OUTPUT_VOLTAGE = 0x28;
+    static constexpr std::uint8_t AXP192_REG_ADC_ENABLE_1 = 0x28;
+    static constexpr std::uint8_t AXP192_REG_CHARGING_CONFIG = 0x33;
+    static constexpr std::uint8_t AXP192_REG_DCDC_OPERATING_MODE = 0x80;
+    static constexpr std::uint8_t AXP192_REG_COULOMB_COUNTER = 0xB8;
+    static constexpr std::uint8_t AXP192_REG_OUTPUT_ENABLE = 0x12;
+    static constexpr std::uint8_t AXP192_REG_PEK_CONFIG = 0x36;
+    static constexpr std::uint8_t AXP192_REG_GPIO0_FUNCTION = 0x90;
+    static constexpr std::uint8_t AXP192_REG_VBUS_IPSOUT_PATH_CONFIG = 030;
+    static constexpr std::uint8_t AXP192_REG_VHTF_CHARGE_THRESHOLD = 0x39;
+    static constexpr std::uint8_t AXP192_REG_BACKUP_BATTERY_CHARGING = 0x35;
+    
+
+    static constexpr TickType_t DEFAULT_REG_TIMEOUT = pdMS_TO_TICKS(10);
+
+    #define TAG_PMU "PMU"
+
+    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    {
+        return this->i2c.read_single_register(this->address, register_address, wait_ticks);
+    }
+    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    {
+        return this->i2c.write_single_register(this->address, register_address, value, wait_ticks);
+    }
+public:
+    PMU(I2CMaster& i2c, std::uint8_t address) : i2c(i2c), address(address) {}
+
+    Result<void, esp_err_t> reset()
+    {
+        ESP_LOGD(TAG_PMU, "Configuring registers...");
+        // Configure registers
+        {
+            auto result = this->write_single_register(AXP192_REG_EXTEN_DCDC2_OUTPUT_CONFIG, 0xff);
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_LDO2_LDO3_OUTPUT_VOLTAGE, 0xcc);   // LDO2 = LED 3.0V, LDO3 = TFT 3.0V
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_ADC_ENABLE_1, 0xff);   // Enable all ADCs.
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_CHARGING_CONFIG, 0xc1);   // Enable charging, 190mA, 4.2V, 90%
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_COULOMB_COUNTER, 0x80);   // Enable coulomb counter (battery energy counter)
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_OUTPUT_ENABLE, 0x4d);   // Enable EXTEN, LDO3, LDO2, DC-DC1 output
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_OUTPUT_ENABLE, 0x4d);   // Enable EXTEN, LDO3, LDO2, DC-DC1 output
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_PEK_CONFIG, 0x4d);   // Shutdown 4s, Shutdown with button press longer than 4s, 
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_GPIO0_FUNCTION, 0x02);   // GPIO0 = Low Noise LDO, 
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_VBUS_IPSOUT_PATH_CONFIG, 0xe0); // No use N_VBUSen, Limit Vbus voltage = 4.4V, Limit Vbus current = 500mA
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_VHTF_CHARGE_THRESHOLD, 0xfc); // 
+            if( !result ) return failure(result);
+            result = this->write_single_register(AXP192_REG_BACKUP_BATTERY_CHARGING, 0xa2); // Enable charging backup battery, 3.0V, 200uA 
+            if( !result ) return failure(result);
+        }
+        
+        ESP_LOGI(TAG_PMU, "Initialized");
+
+        return success();
+    }
+};
+
+static PMU pmu(i2c, 0x34);
+
 #define TAG "MAIN"
 extern "C" void app_main(void)
 {
-    //axp.begin();
-    lcd.begin();
-
     // Initialie i2c
     {
         i2c_config_t i2c_config;
@@ -714,6 +937,16 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Scanning I2C end");
 
     }
+
+    // Initialize PMU
+    {
+        auto result = pmu.reset();
+        if( !result ) {
+            ESP_LOGE(TAG, "Failed to initialize PMU - %x", result.error_code);
+        }
+    }
+
+    lcd.begin();
 
     // Clear IMU queue
     imu_queue.reset();
