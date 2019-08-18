@@ -29,11 +29,15 @@ struct IMUData
     Vector3F acc;
     Vector3F gyro;
     Vector3F mag;
+
+    std::uint8_t acc_max_fifo_usage;
+    std::uint8_t gyro_max_fifo_usage;
 };
 
 static freertos::WaitQueue<IMUData, 10> imu_queue;
 static void imu_task_proc();
 static freertos::StaticTask<8192, decltype(&imu_task_proc)> imu_task(&imu_task_proc);
+static int imu_skip_counter = 0;
 #define TAG_IMU "IMU"
 static void imu_task_proc() 
 {
@@ -53,42 +57,50 @@ static void imu_task_proc()
         IMUData imu_data;
         imu_data.acc = Vector3F(0, 0, 0);
         imu_data.gyro = Vector3F(0, 0, 0);
+        imu_data.mag = Vector3F(0, 0, 0);
+
         int acc_count = 0;
         int gyro_count = 0;
 
         // Read IMU sensor data via I2C
         auto result = imu.update();
         if( result ) {
-            while(auto acc = imu.get_acceleration()) {
-                imu_data.acc += acc.value;
-                acc_count++;
-            }
-            while(auto gyro = imu.get_angular_velocity()) {
-                imu_data.gyro += gyro.value;
-                gyro_count++;
-            }
-            if( acc_count > 0 ) {
-                imu_data.acc /= acc_count;
-            }
-            if( gyro_count > 0 ) {
-                imu_data.gyro /= gyro_count;
-            }
+            if( imu_skip_counter == 0 ) {
+                imu_data.acc_max_fifo_usage  = imu.get_max_accelerometer_fifo_usage();
+                imu_data.gyro_max_fifo_usage = imu.get_max_gyro_fifo_usage();
 
-            ESP_LOGV(TAG_IMU, "IMU sensor measurement end. acc_count=%d, gyro_count=%d acc=%f,%f,%f gyro=%f,%f,%f"
-                , acc_count
-                , gyro_count
-                , imu_data.acc.x_const()
-                , imu_data.acc.y_const()
-                , imu_data.acc.z_const()
-                , imu_data.gyro.x_const()
-                , imu_data.gyro.y_const()
-                , imu_data.gyro.z_const()
-            );
-            imu_queue.send(imu_data);
+                while(auto acc = imu.get_acceleration()) {
+                    imu_data.acc += acc.value;
+                    acc_count++;
+                }
+                while(auto gyro = imu.get_angular_velocity()) {
+                    imu_data.gyro += gyro.value;
+                    gyro_count++;
+                }
+                if( acc_count > 0 ) {
+                    imu_data.acc /= acc_count;
+                }
+                if( gyro_count > 0 ) {
+                    imu_data.gyro /= gyro_count;
+                }
+
+                ESP_LOGV(TAG_IMU, "IMU sensor measurement end. acc_count=%d, gyro_count=%d acc=%f,%f,%f gyro=%f,%f,%f"
+                    , acc_count
+                    , gyro_count
+                    , imu_data.acc.x_const()
+                    , imu_data.acc.y_const()
+                    , imu_data.acc.z_const()
+                    , imu_data.gyro.x_const()
+                    , imu_data.gyro.y_const()
+                    , imu_data.gyro.z_const()
+                );
+                imu_queue.send(imu_data);
+            }
         }
         else {
             ESP_LOGE(TAG_IMU, "IMU update failed - %x", result.error_code);
         }
+        imu_skip_counter = (imu_skip_counter+1) & 0x0f;
     }
 }
 
@@ -158,18 +170,18 @@ extern "C" void app_main(void)
     imu_task.start("IMU", 3, APP_CPU_NUM);
 
     // Start IMU timer
-    imu_timer.start(33333ul); // 33ms
+    imu_timer.start(2000ul * 8); // 2ms 
 
     IMUData imu_data;
     while(imu_queue.receive(imu_data)) {
-        ESP_LOGI(TAG, "IMU data: acc=%f,%f,%f gyro=%f,%f,%f"
-            , imu_data.acc.x_const()
-            , imu_data.acc.y_const()
-            , imu_data.acc.z_const()
-            , imu_data.gyro.x_const()
-            , imu_data.gyro.y_const()
-            , imu_data.gyro.z_const()
-        );
+        // ESP_LOGI(TAG, "IMU data: acc=%f,%f,%f gyro=%f,%f,%f"
+        //     , imu_data.acc.x_const()
+        //     , imu_data.acc.y_const()
+        //     , imu_data.acc.z_const()
+        //     , imu_data.gyro.x_const()
+        //     , imu_data.gyro.y_const()
+        //     , imu_data.gyro.z_const()
+        // );
         lcd.fillScreen(0);
         lcd.setCursor(0, 0);
         lcd.printf("acc : %0.2f, %0.2f, %0.2f\n"
@@ -181,6 +193,10 @@ extern "C" void app_main(void)
             , imu_data.gyro.x_const()
             , imu_data.gyro.y_const()
             , imu_data.gyro.z_const()
+        );
+        lcd.printf("fifo acc: %d, gyro: %d\n"
+            , imu_data.acc_max_fifo_usage
+            , imu_data.gyro_max_fifo_usage
         );
     }
 }

@@ -26,6 +26,9 @@ private:
     
     RingBuffer<Vector3I16, 64> acceleration_queue;
     RingBuffer<Vector3I16, 128> angular_velocity_queue;
+    
+    RingBuffer<std::uint8_t, 16, true> accelerometer_fifo_counts;
+    RingBuffer<std::uint8_t, 16, true> gyro_fifo_counts;
 
     static constexpr std::uint8_t SH200Q_REG_CHIP_ID = 0x30;
     static constexpr std::uint8_t SH200Q_REG_ACC_CONFIG = 0x0E;
@@ -83,7 +86,7 @@ public:
             if( !result ) return failure(result);
             result = this->write_single_register(SH200Q_REG_GYRO_CONFIG_1, 0x13);   // data from HPF, DLPF=3
             if( !result ) return failure(result);
-            result = this->write_single_register(SH200Q_REG_FIFO_CONFIG, 0x80); // Stream mode
+            result = this->write_single_register(SH200Q_REG_FIFO_CONFIG, 0xA0); // Stream mode
             if( !result ) return failure(result);
             result = this->write_single_register(SH200Q_REG_ACC_DATA_FORMAT, 0x01); // Acc full scale = 8[G]
             if( !result ) return failure(result);
@@ -136,10 +139,13 @@ public:
         }
         std::uint8_t acc_count = fifo_status[0] & 0x3f;;
         std::uint8_t gyro_count = fifo_status[1] & 0x3f;
-        ESP_LOGI(TAG, "FIFO status: %02x, %02x", acc_count, gyro_count);
+        ESP_LOGD(TAG, "FIFO status: %02x, %02x", acc_count, gyro_count);
+
+        this->accelerometer_fifo_counts.queue(acc_count);
+        this->gyro_fifo_counts.queue(gyro_count);
 
         // Read acc/gyro sensor data.
-        std::uint8_t buffer[2*6*32];
+        std::uint8_t buffer[2*6*32] = {0,};
 
         {
             std::uint8_t acc_remaining  = acc_count;
@@ -213,6 +219,27 @@ public:
             return failure(false);
         }
         return success<Vector3F>(result.value * GYRO_RESOLUTION);
+    }
+
+    std::uint8_t get_max_accelerometer_fifo_usage()
+    {
+        std::uint8_t usage = 0;
+        for(const auto& value : this->accelerometer_fifo_counts ) {
+            if( value > usage ) {
+                usage = value;
+            }
+        }
+        return usage;
+    }
+    std::uint8_t get_max_gyro_fifo_usage()
+    {
+        std::uint8_t usage = 0;
+        for(const auto& value : this->gyro_fifo_counts ) {
+            if( value > usage ) {
+                usage = value;
+            }
+        }
+        return usage;
     }
 };
 

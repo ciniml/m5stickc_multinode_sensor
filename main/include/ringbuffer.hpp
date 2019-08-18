@@ -6,7 +6,7 @@
 
 // RingBuffer
 
-template<typename TItem, std::size_t Capacity>
+template<typename TItem, std::size_t Capacity, bool DiscardIfFull=false>
 class RingBuffer
 {
 private:
@@ -21,6 +21,46 @@ private:
     std::size_t write_index;
 
 public:
+    class iterator
+    {
+    private:
+        const RingBuffer* parent;
+        std::size_t read_index;
+
+        iterator(const RingBuffer& parent, std::size_t read_index) : parent(&parent), read_index(read_index) {}
+    public:
+        iterator() : parent(nullptr), read_index(0) {}
+        iterator(const iterator& it) : parent(it.parent), read_index(it.read_index) {}
+
+        bool operator==(const iterator& rhs) const
+        {
+            return this->parent == rhs.parent && this->read_index == rhs.read_index;
+        }
+        bool operator!=(const iterator& rhs) const
+        {
+            return this->parent != rhs.parent || this->read_index != rhs.read_index;
+        }
+        const TItem& operator*() { return this->parent->buffer.at(this->read_index & Mask); }
+        const TItem& operator->() { return this->parent->buffer.at(this->read_index & Mask); }
+
+        iterator& operator++() 
+        {
+            if( this->read_index == this->parent->write_index ) {
+                return *this;
+            }
+            this->read_index = (this->read_index + 1) & AdvanceMask;
+            return *this;
+        }
+        iterator operator++(int) 
+        {
+            auto it = *this;
+            return ++it;
+        }
+
+        friend class RingBuffer;
+    };
+
+
     RingBuffer() : read_index(0), write_index(0) {}
 
     bool is_empty() const { return this->read_index == this->write_index; }
@@ -29,7 +69,12 @@ public:
     bool queue(const TItem& item)
     {
         if( this->is_full() ) {
-            return false;
+            if( DiscardIfFull ) {
+                this->read_index = (this->read_index + 1) & AdvanceMask; 
+            }
+            else {
+                return false;
+            }
         }
         this->buffer[this->write_index & Mask] = item;
         this->write_index = (this->write_index + 1) & AdvanceMask;
@@ -53,6 +98,9 @@ public:
             this->dequeue();
         }
     }
+
+    iterator begin() const { return iterator(*this, this->read_index); }
+    iterator end() const { return iterator(*this, this->write_index); }
 };
 
 #endif // RINGBUFFER_HPP__

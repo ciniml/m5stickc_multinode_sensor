@@ -202,6 +202,20 @@ public:
 
         return success<std::uint8_t>(buffer);
     }
+    Result<void, esp_err_t> read_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t* buffer, std::size_t length, TickType_t wait_ticks)
+    {
+        I2CCommandLink commands;
+        if( !commands ) {
+            return failure(ESP_ERR_NO_MEM);
+        }
+        auto result = commands.read_register(device_address, register_address, buffer, length, i2c_ack_type_t::I2C_MASTER_LAST_NACK);
+        if( !result ) return failure(result);
+
+        result = this->execute(commands, wait_ticks);
+        if( !result ) return failure(result);
+
+        return success();
+    }
     Result<void, esp_err_t> write_single_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks)
     {
         I2CCommandLink commands;
@@ -209,6 +223,20 @@ public:
             return failure(ESP_ERR_NO_MEM);
         }
         auto result = commands.write_register(device_address, register_address, &value, 1);
+        if( !result ) return failure(result);
+
+        result = this->execute(commands, wait_ticks);
+        if( !result ) return failure(result);
+
+        return success();
+    }
+    Result<void, esp_err_t> write_register(std::uint8_t device_address, std::uint8_t register_address, const std::uint8_t* value, std::size_t length, TickType_t wait_ticks)
+    {
+        I2CCommandLink commands;
+        if( !commands ) {
+            return failure(ESP_ERR_NO_MEM);
+        }
+        auto result = commands.write_register(device_address, register_address, value, length);
         if( !result ) return failure(result);
 
         result = this->execute(commands, wait_ticks);
