@@ -947,6 +947,7 @@ extern "C" void app_main(void)
     }
 
     lcd.begin();
+    lcd.setRotation(3);
 
     // Clear IMU queue
     imu_queue.reset();
@@ -955,7 +956,7 @@ extern "C" void app_main(void)
     imu_task.start("IMU", 3, APP_CPU_NUM);
 
     // Start IMU timer
-    imu_timer.start(1000000ul);
+    imu_timer.start(33333ul); // 33ms
 
     IMUData imu_data;
     while(imu_queue.receive(imu_data)) {
@@ -963,6 +964,18 @@ extern "C" void app_main(void)
             , imu_data.acc.x_const()
             , imu_data.acc.y_const()
             , imu_data.acc.z_const()
+            , imu_data.gyro.x_const()
+            , imu_data.gyro.y_const()
+            , imu_data.gyro.z_const()
+        );
+        lcd.fillScreen(0);
+        lcd.setCursor(0, 0);
+        lcd.printf("acc : %0.2f, %0.2f, %0.2f\n"
+            , imu_data.acc.x_const()
+            , imu_data.acc.y_const()
+            , imu_data.acc.z_const()
+        );
+        lcd.printf("gyro: %0.2f, %0.2f, %0.2f\n"
             , imu_data.gyro.x_const()
             , imu_data.gyro.y_const()
             , imu_data.gyro.z_const()
