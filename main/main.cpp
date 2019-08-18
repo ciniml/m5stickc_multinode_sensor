@@ -33,7 +33,7 @@ struct IMUData
 
 static freertos::WaitQueue<IMUData, 10> imu_queue;
 static void imu_task_proc();
-static StaticTask<8192, decltype(&imu_task_proc)> imu_task(&imu_task_proc);
+static freertos::StaticTask<8192, decltype(&imu_task_proc)> imu_task(&imu_task_proc);
 #define TAG_IMU "IMU"
 static void imu_task_proc() 
 {
@@ -47,8 +47,8 @@ static void imu_task_proc()
             return;
         }
     }
-    auto task = Task::current();
-    while( Task::notify_wait(0, 1, portMAX_DELAY).is_success ) {
+    auto task = freertos::Task::current();
+    while( freertos::Task::notify_wait(0, 1, portMAX_DELAY).is_success ) {
         ESP_LOGV(TAG_IMU, "IMU sensor measurement begin");
         IMUData imu_data;
         imu_data.acc = Vector3F(0, 0, 0);
