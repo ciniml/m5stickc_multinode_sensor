@@ -11,6 +11,8 @@
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 
+#include "result.hpp"
+
 namespace freertos
 {
 	class Mutex
@@ -320,4 +322,99 @@ namespace freertos
 		future<TResult> get_future() { return this->inner->get_future(); }
 	};
 };
+
+
+struct Task
+{
+    TaskHandle_t handle;
+    bool own_handle;
+    
+    Task(TaskHandle_t handle) : handle(handle), own_handle(false) {}
+    Task(TaskHandle_t handle, bool own_handle) : handle(handle), own_handle(own_handle) {}
+    Task(const Task& task) : handle(task.handle), own_handle(false) {}
+    Task(Task&& task) : handle(task.handle), own_handle(task.own_handle) 
+    {
+        task.own_handle = false;
+    }
+
+    ~Task() {
+        if( this->own_handle && this->handle != nullptr ) {
+            vTaskDelete(this->handle);
+            this->handle = nullptr;
+            this->own_handle = false;
+        }
+    }
+
+    struct NotifyFromISRResut
+    {
+        bool success;
+        bool higher_priority_task_woken;
+    };
+
+    operator TaskHandle_t() const { return this->handle; }
+    operator bool() const { return this->handle != nullptr; }
+
+    bool notify(std::uint32_t value, eNotifyAction action)
+    {
+        return xTaskNotify(this->handle, value, action) == pdPASS;
+    }
+    Result<bool, bool> notify_from_isr(std::uint32_t value, eNotifyAction action)
+    {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        if( xTaskNotifyFromISR(this->handle, value, action, &higher_priority_task_woken) == pdTRUE ) {
+            return success(higher_priority_task_woken == pdTRUE);
+        }
+        else {
+            return failure(true);
+        }
+    }
+
+    static Task current()
+    {
+        return Task(xTaskGetCurrentTaskHandle());
+    }
+
+    static Result<std::uint32_t, bool> notify_wait(std::uint32_t bits_to_clear_on_entry, std::uint32_t bits_to_clear_on_exit, TickType_t ticks_to_wait)
+    {
+        std::uint32_t notification_value = 0;
+        auto result = xTaskNotifyWait(bits_to_clear_on_entry, bits_to_clear_on_exit, &notification_value, ticks_to_wait);
+        if( result != pdPASS ) {
+            return failure(true);
+        }
+        else {
+            return success<std::uint32_t>(notification_value);
+        }
+    }
+};
+
+
+template<std::uint32_t StackSize, typename TaskFunc>
+struct StaticTask 
+{
+    typedef StaticTask<StackSize, TaskFunc> SelfType;
+
+    StackType_t stack[StackSize];
+    TaskHandle_t handle;
+    StaticTask_t context;
+    TaskFunc task_func;
+
+    static void task_proc_wrapper(void* parameters) 
+    {
+        auto this_ = reinterpret_cast<SelfType*>(parameters);
+        this_->task_func();
+    }
+
+    StaticTask(TaskFunc&& task_func) : handle(nullptr), task_func(std::forward<TaskFunc>(task_func)) {}
+
+    operator bool() const { return this->handle != nullptr; }
+
+    bool start(const char* name, UBaseType_t priority, BaseType_t core_id) 
+    {
+        this->handle = xTaskCreateStaticPinnedToCore(&StaticTask::task_proc_wrapper, name, StackSize, this, priority, this->stack, &this->context, core_id);
+        return this->handle != nullptr;
+    }
+
+    Task task() const { return Task(this->handle); }
+};
+
 #endif //FREERTOS_UTIL_HPP__
