@@ -45,7 +45,7 @@ private:
     static constexpr float ACCELEROMETER_RESOLUTION = 8.0/32768.0;
     static constexpr float GYRO_RESOLUTION = 2000.0/32768.0;
 
-    #define TAG_IMU "IMU"
+    static constexpr const char* TAG = "IMU";
 
     Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
     {
@@ -66,15 +66,15 @@ public:
         }
 
         // Check chip ID
-        ESP_LOGI(TAG_IMU, "Checking chip id...");
+        ESP_LOGI(TAG, "Checking chip id...");
         auto chip_id = this->read_single_register(SH200Q_REG_CHIP_ID);
         if( !chip_id ) return failure(chip_id);
-        ESP_LOGI(TAG_IMU, "Chip ID: %02x", chip_id.value);
+        ESP_LOGI(TAG, "Chip ID: %02x", chip_id.value);
         if( chip_id.value != SH200Q_CHIP_ID ) {
             return failure(ESP_ERR_INVALID_RESPONSE);
         }
 
-        ESP_LOGI(TAG_IMU, "Configuring registers...");
+        ESP_LOGI(TAG, "Configuring registers...");
         // Configure registers
         {
             auto result = this->write_single_register(SH200Q_REG_ACC_CONFIG, 0x91); // HPF disabled, internal clock, ODR=256Hz, filter enabled
@@ -91,7 +91,7 @@ public:
             if( !result ) return failure(result);
         }
         
-        ESP_LOGI(TAG_IMU, "Resetting PLL and ADC...");
+        ESP_LOGI(TAG, "Resetting PLL and ADC...");
 
         // Reset PLL
         {
@@ -111,7 +111,7 @@ public:
             if( !write_result ) return failure(write_result);
         }   
 
-        ESP_LOGI(TAG_IMU, "Initialized");
+        ESP_LOGI(TAG, "Initialized");
 
         this->acceleration_queue.reset();
         this->angular_velocity_queue.reset();
@@ -136,7 +136,7 @@ public:
         }
         std::uint8_t acc_count = fifo_status[0] & 0x3f;;
         std::uint8_t gyro_count = fifo_status[1] & 0x3f;
-        ESP_LOGI(TAG_IMU, "FIFO status: %02x, %02x", acc_count, gyro_count);
+        ESP_LOGI(TAG, "FIFO status: %02x, %02x", acc_count, gyro_count);
 
         // Read acc/gyro sensor data.
         std::uint8_t buffer[2*6*32];
