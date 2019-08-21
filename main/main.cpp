@@ -17,7 +17,7 @@
 #include <timer.hpp>
 #include <ringbuffer.hpp>
 #include <vector3.hpp>
-#include <imu.hpp>
+#include <imu_mpu6886.hpp>
 #include <pmu.hpp>
 
 static M5Display lcd;
@@ -30,8 +30,7 @@ struct IMUData
     Vector3F gyro;
     Vector3F mag;
 
-    std::uint8_t acc_max_fifo_usage;
-    std::uint8_t gyro_max_fifo_usage;
+    std::uint16_t max_fifo_usage;
 };
 
 static freertos::WaitQueue<IMUData, 10> imu_queue;
@@ -41,7 +40,7 @@ static int imu_skip_counter = 0;
 #define TAG_IMU "IMU"
 static void imu_task_proc() 
 {
-    static IMU imu(i2c, 0x6C);
+    static IMU imu(i2c, 0x68);
     {
         ESP_LOGI(TAG_IMU, "Initializing IMU sensor");
         // Initialize IMU
@@ -66,8 +65,7 @@ static void imu_task_proc()
         auto result = imu.update();
         if( result ) {
             if( imu_skip_counter == 0 ) {
-                imu_data.acc_max_fifo_usage  = imu.get_max_accelerometer_fifo_usage();
-                imu_data.gyro_max_fifo_usage = imu.get_max_gyro_fifo_usage();
+                imu_data.max_fifo_usage  = imu.get_max_fifo_usage();
 
                 while(auto acc = imu.get_acceleration()) {
                     imu_data.acc += acc.value;
@@ -100,7 +98,7 @@ static void imu_task_proc()
         else {
             ESP_LOGE(TAG_IMU, "IMU update failed - %x", result.error_code);
         }
-        imu_skip_counter = (imu_skip_counter+1) & 0x0f;
+        //imu_skip_counter = (imu_skip_counter+1) & 0x0f;
     }
 }
 
@@ -131,26 +129,26 @@ extern "C" void app_main(void)
     }
 
     // Do I2C Scan
-    {
-        ESP_LOGI(TAG, "Scanning I2C Bus begin...");
-        for(std::uint8_t device_address = 0; device_address <= 0x7f; device_address++ ) {
-            I2CCommandLink commands;
-            if( !commands ) continue;
+    // {
+    //     ESP_LOGI(TAG, "Scanning I2C Bus begin...");
+    //     for(std::uint8_t device_address = 0; device_address <= 0x7f; device_address++ ) {
+    //         I2CCommandLink commands;
+    //         if( !commands ) continue;
 
-            auto result = commands.start()
-                .then([&commands, device_address](){ return commands.write_byte((device_address << 1) | 0, true); })
-                .then([&commands](){ return commands.stop(); })
-                .then([&commands](){ return i2c.execute(commands, pdMS_TO_TICKS(50)); });
-            if( result.is_success ) {
-                ESP_LOGI(TAG, "Address %02x: OK", device_address);
-            }
-            else if( result.error_code == ESP_ERR_TIMEOUT ) {
-                ESP_LOGI(TAG, "Address %02x: Timed out", device_address);
-            }
-        }
-        ESP_LOGI(TAG, "Scanning I2C end");
+    //         auto result = commands.start()
+    //             .then([&commands, device_address](){ return commands.write_byte((device_address << 1) | 0, true); })
+    //             .then([&commands](){ return commands.stop(); })
+    //             .then([&commands](){ return i2c.execute(commands, pdMS_TO_TICKS(50)); });
+    //         if( result.is_success ) {
+    //             ESP_LOGI(TAG, "Address %02x: OK", device_address);
+    //         }
+    //         else if( result.error_code == ESP_ERR_TIMEOUT ) {
+    //             ESP_LOGI(TAG, "Address %02x: Timed out", device_address);
+    //         }
+    //     }
+    //     ESP_LOGI(TAG, "Scanning I2C end");
 
-    }
+    // }
 
     // Initialize PMU
     {
@@ -170,7 +168,7 @@ extern "C" void app_main(void)
     imu_task.start("IMU", 3, APP_CPU_NUM);
 
     // Start IMU timer
-    imu_timer.start(2000ul * 8); // 2ms 
+    imu_timer.start(5000ul * 8); 
 
     IMUData imu_data;
     while(imu_queue.receive(imu_data)) {
@@ -194,9 +192,8 @@ extern "C" void app_main(void)
             , imu_data.gyro.y_const()
             , imu_data.gyro.z_const()
         );
-        lcd.printf("fifo acc: %d, gyro: %d\n"
-            , imu_data.acc_max_fifo_usage
-            , imu_data.gyro_max_fifo_usage
+        lcd.printf("fifo: %d\n"
+            , imu_data.max_fifo_usage
         );
     }
 }

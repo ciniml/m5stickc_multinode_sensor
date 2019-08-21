@@ -145,16 +145,16 @@ public:
             return failure(ESP_ERR_INVALID_ARG);
         }
 
-        auto result = i2c_driver_install(this->port, I2C_MODE_MASTER, 0, 0, 0);
+        auto result = i2c_param_config(this->port, &config);
         if( result != ESP_OK ) {
             return failure(result);
         }
 
-        result = i2c_param_config(this->port, &config);
+        result = i2c_driver_install(this->port, I2C_MODE_MASTER, 0, 0, 0);
         if( result != ESP_OK ) {
-            i2c_driver_delete(this->port);
             return failure(result);
         }
+
 
         this->initialized = true;
         return success();
