@@ -6,20 +6,19 @@
 #include <esp_timer.h>
 #include <esp_system.h>
 
-template<typename TimerFunc>
+template<typename TimerType>
 struct Timer
 {
-    typedef Timer<TimerFunc> SelfType;
+    typedef Timer<TimerType> SelfType;
 
     esp_timer_handle_t handle;
-    TimerFunc timer_func;
 
     static void timer_proc_wrapper(void* parameters)
     {
-        auto this_ = reinterpret_cast<SelfType*>(parameters);
-        this_->timer_func();
+        auto this_ = static_cast<TimerType*>(reinterpret_cast<SelfType*>(parameters));
+        (*this_)();
     }
-    Timer(TimerFunc&& timer_func) : timer_func(std::forward<TimerFunc>(timer_func)) {}
+    Timer() : handle(nullptr) {}
 
     Result<bool, esp_err_t> start(uint64_t period_us) noexcept
     {

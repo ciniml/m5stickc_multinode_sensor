@@ -10,3 +10,6 @@
 [submodule "components/arduino"]
 	path = components/arduino
 	url = https://github.com/espressif/arduino-esp32
+[submodule "main/bmm150"]
+	path = main/bmm150
+	url = https://github.com/BoschSensortec/BMM150-Sensor-API.git

@@ -45,6 +45,8 @@ struct Result
 
     operator bool() const { return this->is_success; }
 
+    T unwrap_or(T optb) { return this->is_success ? this->value : optb; }
+
     template<typename Func>
     typename std::result_of<Func(T&&)>::type then(Func&& func)
     {

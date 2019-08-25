@@ -383,37 +383,44 @@ namespace freertos
 				return success<std::uint32_t>(notification_value);
 			}
 		}
+
+		static void delay_ms(std::uint32_t delay_ms)
+		{
+			vTaskDelay(pdMS_TO_TICKS(delay_ms));
+		}
 	};
 
 
-	template<std::uint32_t StackSize, typename TaskFunc>
-	struct StaticTask 
+	template<std::uint32_t StackSize, typename TaskType>
+	class StaticTask 
 	{
-		typedef StaticTask<StackSize, TaskFunc> SelfType;
+	public:
+		typedef StaticTask<StackSize, TaskType> SelfType;
 
+	private:
 		StackType_t stack[StackSize];
 		TaskHandle_t handle;
 		StaticTask_t context;
-		TaskFunc task_func;
 
 		static void task_proc_wrapper(void* parameters) 
 		{
-			auto this_ = reinterpret_cast<SelfType*>(parameters);
-			this_->task_func();
+			auto this_ = static_cast<TaskType*>(reinterpret_cast<SelfType*>(parameters));
+			(*this_)();
 		}
-
-		StaticTask(TaskFunc&& task_func) : handle(nullptr), task_func(std::forward<TaskFunc>(task_func)) {}
-
-		operator bool() const { return this->handle != nullptr; }
-
+	protected:
 		bool start(const char* name, UBaseType_t priority, BaseType_t core_id) 
 		{
 			this->handle = xTaskCreateStaticPinnedToCore(&StaticTask::task_proc_wrapper, name, StackSize, this, priority, this->stack, &this->context, core_id);
 			return this->handle != nullptr;
 		}
 
+	public:
+		StaticTask() : handle(nullptr) {}
+
+		operator bool() const { return this->handle != nullptr; }
 		Task task() const { return Task(this->handle); }
 	};
+	
 };
 
 

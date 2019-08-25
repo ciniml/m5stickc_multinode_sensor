@@ -169,23 +169,17 @@ public:
         uint8_t buffer[8];
         uint8_t adc_rate;
 
-        I2CCommandLink commands;
-        if( !commands ) {
-            return failure(ESP_FAIL);
-        }
+        RESULT_TRY( this->i2c.read_register(this->address, AXP192_REG_ADC_RATE_TS_CONTROL, &adc_rate, 1, i2c_ack_type_t::I2C_MASTER_LAST_NACK) );
+        RESULT_TRY( this->i2c.read_register(this->address, AXP192_REG_COULOMB_COUNTER_CHARGE, buffer, 8, i2c_ack_type_t::I2C_MASTER_LAST_NACK) );
 
-        RESULT_TRY( commands.read_register(this->address, AXP192_REG_ADC_RATE_TS_CONTROL, &adc_rate, 1, i2c_ack_type_t::I2C_MASTER_LAST_NACK) );
-        RESULT_TRY( commands.read_register(this->address, AXP192_REG_COULOMB_COUNTER_CHARGE, buffer, 8, i2c_ack_type_t::I2C_MASTER_LAST_NACK) );
-        RESULT_TRY( this->i2c.execute(commands, DEFAULT_REG_TIMEOUT) );
-
-        std::uint32_t charge = (static_cast<std::uint32_t>(buffer[3]) << 24)
-                             | (static_cast<std::uint32_t>(buffer[2]) << 16)
-                             | (static_cast<std::uint32_t>(buffer[1]) <<  8)
-                             | (static_cast<std::uint32_t>(buffer[0]) <<  0);
-        std::uint32_t discharge = (static_cast<std::uint32_t>(buffer[7]) << 24)
-                                | (static_cast<std::uint32_t>(buffer[6]) << 16)
-                                | (static_cast<std::uint32_t>(buffer[5]) <<  8)
-                                | (static_cast<std::uint32_t>(buffer[4]) <<  0);
+        std::int64_t charge = (static_cast<std::uint32_t>(buffer[0]) << 24)
+                             | (static_cast<std::uint32_t>(buffer[1]) << 16)
+                             | (static_cast<std::uint32_t>(buffer[2]) <<  8)
+                             | (static_cast<std::uint32_t>(buffer[3]) <<  0);
+        std::int64_t discharge = (static_cast<std::uint32_t>(buffer[4]) << 24)
+                                | (static_cast<std::uint32_t>(buffer[5]) << 16)
+                                | (static_cast<std::uint32_t>(buffer[6]) <<  8)
+                                | (static_cast<std::uint32_t>(buffer[7]) <<  0);
         std::uint8_t adc_sample_rate_exp = adc_rate >> 6;
         std::uint8_t adc_sample_rate = 25 << adc_sample_rate_exp;
 

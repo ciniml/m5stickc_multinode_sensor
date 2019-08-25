@@ -1,0 +1,130 @@
+diff --git a/bmm150.c b/bmm150.c
+index baf5c48..94f0c27 100644
+--- a/bmm150.c
++++ b/bmm150.c
+@@ -529,7 +529,7 @@ int8_t bmm150_init(struct bmm150_dev *dev)
+ 		/* Power up the sensor from suspend to sleep mode */
+ 		rslt = set_power_control_bit(BMM150_POWER_CNTRL_ENABLE, dev);
+ 		/* Start-up time delay of 3ms*/
+-		dev->delay_ms(BMM150_START_UP_TIME);
++		dev->delay_ms(dev, BMM150_START_UP_TIME);
+ 		if (rslt ==  BMM150_OK) {
+ 			/* Chip ID of the sensor is read */
+ 			rslt = bmm150_get_regs(BMM150_CHIP_ID_ADDR, &chip_id, 1, dev);
+@@ -565,7 +565,7 @@ int8_t bmm150_set_regs(uint8_t reg_addr, uint8_t *reg_data, uint8_t len, const s
+ 		/* Write the data to the reg_addr */
+ 		/* SPI write requires to set The MSB of reg_addr as 0
+ 		but in default the MSB is always 0 */
+-		rslt = dev->write(dev->dev_id, reg_addr, reg_data, len);
++		rslt = dev->write(dev, reg_addr, reg_data, len);
+ 	} else {
+ 		rslt = BMM150_E_NULL_PTR;
+ 	}
+@@ -589,7 +589,7 @@ int8_t bmm150_get_regs(uint8_t reg_addr, uint8_t *reg_data, uint8_t len, const s
+ 			reg_addr = reg_addr | 0x80;
+ 		}
+ 		/* Read the data from the reg_addr */
+-		rslt = dev->read(dev->dev_id, reg_addr, reg_data, len);
++		rslt = dev->read(dev, reg_addr, reg_data, len);
+ 	} else {
+ 		rslt = BMM150_E_NULL_PTR;
+ 	}
+@@ -601,7 +601,7 @@ int8_t bmm150_get_regs(uint8_t reg_addr, uint8_t *reg_data, uint8_t len, const s
+  * @brief This API is used to perform soft-reset of the sensor
+  * where all the registers are reset to their default values except 0x4B.
+  */
+-int8_t bmm150_soft_reset(const struct bmm150_dev *dev)
++int8_t bmm150_soft_reset(struct bmm150_dev *dev)
+ {
+ 	int8_t rslt;
+ 	uint8_t reg_data;
+@@ -614,7 +614,7 @@ int8_t bmm150_soft_reset(const struct bmm150_dev *dev)
+ 		if (rslt ==  BMM150_OK) {
+ 			reg_data = reg_data | BMM150_SET_SOFT_RESET;
+ 			rslt = bmm150_set_regs(BMM150_POWER_CONTROL_ADDR, &reg_data, 1, dev);
+-			dev->delay_ms(BMM150_SOFT_RESET_DELAY);
++			dev->delay_ms(dev, BMM150_SOFT_RESET_DELAY);
+ 		}
+ 	}
+ 
+@@ -1137,7 +1137,7 @@ static int8_t suspend_to_sleep_mode(struct bmm150_dev *dev)
+ 		if (dev->settings.pwr_cntrl_bit == BMM150_POWER_CNTRL_DISABLE) {
+ 			rslt = set_power_control_bit(BMM150_POWER_CNTRL_ENABLE, dev);
+ 			/* Start-up time delay of 3ms*/
+-			dev->delay_ms(BMM150_START_UP_TIME);
++			dev->delay_ms(dev, BMM150_START_UP_TIME);
+ 		}
+ 	}
+ 
+@@ -1699,7 +1699,7 @@ static int16_t compensate_z(int16_t mag_data_z, uint16_t data_rhall, const struc
+ static int8_t perform_normal_self_test(const struct bmm150_dev *dev)
+ {
+ 	int8_t rslt;
+-	uint8_t self_test_bit;
++	uint8_t self_test_bit = 0;
+ 
+ 	/* Triggers the start of normal self test */
+ 	rslt = enable_normal_self_test(&self_test_bit, dev);
+@@ -1731,7 +1731,7 @@ static int8_t enable_normal_self_test(uint8_t *self_test_enable, const struct bm
+ 		reg_data = BMM150_SET_BITS_POS_0(reg_data, BMM150_SELF_TEST, self_test_val);
+ 		/* Write the data to 0x4C register to trigger self test */
+ 		rslt = bmm150_set_regs(BMM150_OP_MODE_ADDR, &reg_data, 1, dev);
+-		dev->delay_ms(BMM150_NORMAL_SELF_TEST_DELAY);
++		dev->delay_ms(dev, BMM150_NORMAL_SELF_TEST_DELAY);
+ 		if (rslt == BMM150_OK) {
+ 			/* Read the data from register 0x4C */
+ 			rslt = bmm150_get_regs(BMM150_OP_MODE_ADDR, &reg_data, 1, dev);
+@@ -1863,7 +1863,7 @@ static int8_t adv_self_test_measurement(uint8_t self_test_current, int16_t *data
+ 		dev->settings.pwr_mode = BMM150_FORCED_MODE;
+ 		rslt = bmm150_set_op_mode(dev);
+ 		/* Delay to ensure measurement is complete */
+-		dev->delay_ms(BMM150_ADV_SELF_TEST_DELAY);
++		dev->delay_ms(dev, BMM150_ADV_SELF_TEST_DELAY);
+ 		if (rslt == BMM150_OK) {
+ 			/* Read Mag data and store the value of Z axis data */
+ 			rslt = bmm150_read_mag_data(dev);
+diff --git a/bmm150.h b/bmm150.h
+index 284344d..3370823 100644
+--- a/bmm150.h
++++ b/bmm150.h
+@@ -122,7 +122,7 @@ int8_t bmm150_get_regs(uint8_t reg_addr, uint8_t *reg_data, uint8_t len, const s
+  * @return Result of API execution status
+  * @retval zero -> Success / +ve value -> Warning / -ve value -> Error
+  */
+-int8_t bmm150_soft_reset(const struct bmm150_dev *dev);
++int8_t bmm150_soft_reset(struct bmm150_dev *dev);
+ 
+ /*!
+  * @brief This API is used to set the power mode of the sensor.
+diff --git a/bmm150_defs.h b/bmm150_defs.h
+index 63076a0..2ce9801 100644
+--- a/bmm150_defs.h
++++ b/bmm150_defs.h
+@@ -404,14 +404,16 @@ enum bmm150_intf {
+ 
+ /********************************************************/
+ /**\name	TYPE DEFINITIONS */
++
++struct bmm150_dev;
+ /*!
+  * @brief Bus communication function pointer which should be mapped to
+  * the platform specific read and write functions of the user
+  */
+-typedef int8_t (*bmm150_com_fptr_t)(uint8_t dev_id, uint8_t reg_addr, uint8_t *read_data, uint16_t len);
++typedef int8_t (*bmm150_com_fptr_t)(struct bmm150_dev* dev, uint8_t reg_addr, uint8_t *read_data, uint16_t len);
+ 
+ /*!	delay function pointer */
+-typedef void (*bmm150_delay_fptr_t)(uint32_t);
++typedef void (*bmm150_delay_fptr_t)(struct bmm150_dev* dev, uint32_t);
+ 
+ /********************************************************/
+ /**\name	STRUCTURE DEFINITIONS*/
+@@ -561,6 +563,8 @@ struct bmm150_dev {
+ 	uint16_t int_status;
+ 	/*! Structure containing mag data */
+ 	struct bmm150_mag_data data;
++	/*! User-defined context */
++	void* context;
+ };
+ 
+ #endif /* BMM150_DEFS_H_ */
