@@ -33,6 +33,10 @@ enum class ESPNowPacketType : std::uint8_t
     DiscoveryResponse,
     ConnectionRequest,
     ConnectionResponse,
+    NotifyDelay,
+    DelayResponse,
+    MeasurementRequest,
+    MeasurementResponse,
     SensorData,
 };
 
@@ -45,14 +49,46 @@ struct __attribute__((packed)) ESPNowAddress
     {
         memcpy(this->values, values, ESP_NOW_ETH_ALEN);
     }
-
+    operator const std::uint8_t*() const
+    {
+        return this->values;
+    }
+    int compare(const ESPNowAddress& rhs) const
+    {
+        return memcmp(this->values, rhs.values, ESP_NOW_ETH_ALEN);
+    }
+    bool operator<(const ESPNowAddress& rhs) const
+    {
+        return this->compare(rhs) < 0;
+    }
+    bool operator<=(const ESPNowAddress& rhs) const
+    {
+        return this->compare(rhs) <= 0;
+    }
+    bool operator>(const ESPNowAddress& rhs) const
+    {
+        return this->compare(rhs) > 0;
+    }
+    bool operator>=(const ESPNowAddress& rhs) const
+    {
+        return this->compare(rhs) >= 0;
+    }
     bool operator==(const ESPNowAddress& rhs) const
     {
-        return memcmp(this->values, rhs.values, ESP_NOW_ETH_ALEN) == 0;
+        return this->compare(rhs) == 0;
     }
     bool operator!=(const ESPNowAddress& rhs) const
     {
         return !this->operator==(rhs);
+    }
+
+    void copy_from(const void* values)
+    {
+        memcpy(this->values, values, ESP_NOW_ETH_ALEN);
+    }
+    void copy_to(void* values) const
+    {
+        memcpy(values, this->values, ESP_NOW_ETH_ALEN);
     }
 };
 
@@ -69,19 +105,45 @@ struct __attribute__((packed)) ESPNowPacket
     std::uint64_t timestamp;
     union 
     {
+        struct
+        {
+            std::uint64_t target_time;
+        } measurement_request;
         struct 
         {
-            float acc[3];
-            float gyro[3];
-            float mag[3];
+            std::uint8_t number_of_samples;
+            std::uint8_t reserved[3];
+            std::uint64_t timestamp;
+            struct 
+            {
+                float acc[3];
+                float gyro[3];
+                float mag[3];
+            } samples[4];
+            template<typename Timestamp> void set_timestamp(Timestamp timestamp) { this->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(timestamp).count(); }
         } sensor_data;
     } body;
 
+    std::chrono::microseconds timestamp_typed() const 
+    {
+        return std::chrono::microseconds(this->timestamp);
+    }
+    template<typename Timestamp>
+    void set_timestamp(const Timestamp& timestamp)
+    {
+        this->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(timestamp).count();
+    }
     Result<std::size_t, bool> get_size_from_type() const 
     {
         switch(this->type) {
         case ESPNowPacketType::Discovery:  return success<std::size_t>(0);
         case ESPNowPacketType::DiscoveryResponse:  return success<std::size_t>(0);
+        case ESPNowPacketType::ConnectionRequest:  return success<std::size_t>(0);
+        case ESPNowPacketType::ConnectionResponse:  return success<std::size_t>(0);
+        case ESPNowPacketType::NotifyDelay:  return success<std::size_t>(0);
+        case ESPNowPacketType::DelayResponse:  return success<std::size_t>(0);
+        case ESPNowPacketType::MeasurementRequest:  return success(sizeof(this->body.measurement_request));
+        case ESPNowPacketType::MeasurementResponse:  return success<std::size_t>(0);
         case ESPNowPacketType::SensorData: return success(sizeof(this->body.sensor_data));
         default: return failure(false);
         }
@@ -132,12 +194,15 @@ struct ESPNowCallbackEvent
     static constexpr std::size_t FIXED_BUFFER_SIZE = sizeof(ESPNowPacket);
     ESPNowCallbackEventType type;
     std::uint8_t  buffer[FIXED_BUFFER_SIZE];
-    ESPNowAddress  address
+    ESPNowAddress  address;
     std::size_t   length;
-    
+    std::chrono::microseconds timestamp;
+
     ESPNowCallbackEvent() : length(0) {}
 
-    ESPNowCallbackEvent(ESPNowCallbackEventType type, const ESPNowAddress& address, const std::uint8_t* data, std::size_t length) : type(type), address(address), length(0)
+    template<typename Timestamp>
+    ESPNowCallbackEvent(ESPNowCallbackEventType type, const ESPNowAddress& address, const std::uint8_t* data, std::size_t length, Timestamp timestamp) 
+         : type(type), address(address), length(0), timestamp(std::chrono::duration_cast<std::chrono::milliseconds>(timestamp))
     {
         if( length > FIXED_BUFFER_SIZE ) {
             return;
@@ -146,9 +211,10 @@ struct ESPNowCallbackEvent
         this->length = length;
     }
 
+
     ESPNowCallbackEvent(const ESPNowCallbackEvent& obj) : type(obj.type), length(obj.length)
     {
-        memcpy(this->address, obj.address, ESP_NOW_ETH_ALEN);
+        this->address.copy_from(obj.address);
         memcpy(this->buffer, obj.buffer, obj.length);
     }
 

@@ -2,6 +2,7 @@
 #define TIMER_HPP__
 
 #include <cstdint>
+#include <chrono>
 #include <esp_err.h>
 #include <esp_timer.h>
 #include <esp_system.h>
@@ -20,7 +21,7 @@ struct Timer
     }
     Timer() : handle(nullptr) {}
 
-    Result<bool, esp_err_t> start(uint64_t period_us) noexcept
+    Result<bool, esp_err_t> start(std::chrono::microseconds period) noexcept
     {
         esp_timer_create_args_t args;
         args.name = "Timer";
@@ -33,7 +34,7 @@ struct Timer
             return failure(result);
         }
         
-        result = esp_timer_start_periodic(this->handle, period_us);
+        result = esp_timer_start_periodic(this->handle, period.count());
         if( result != ESP_OK ) {
             return failure(result);
         }

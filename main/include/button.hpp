@@ -65,7 +65,7 @@ private:
                     Event event;
                     event.position = static_cast<Position>(button);
                     event.type = (new_state & button_bit) == 0 ? EventType::Pushed : EventType::Released;
-                    this->queue.send(event, 0);
+                    this->queue.send(event, freertos::Ticks::zero());
                 }
             }
 
@@ -90,7 +90,7 @@ public:
             return failure(result);
         }
 
-        RESULT_TRY(this->update_timer.start(1000ul));
+        RESULT_TRY(this->update_timer.start(std::chrono::microseconds(1000)));
         
         return success();
     }
@@ -100,7 +100,7 @@ public:
         this->update_timer.queue.reset();
     }
 
-    Result<Event, bool> read_event(TickType_t wait_ticks = 0)
+    Result<Event, bool> read_event(freertos::Ticks wait_ticks = freertos::Ticks(0))
     {
         Event event;
         auto result = this->update_timer.queue.receive(event, wait_ticks);

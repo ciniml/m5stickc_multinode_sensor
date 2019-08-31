@@ -12,6 +12,7 @@ struct Vector3
     Vector3() = default;
     Vector3(const TElement p) : items(p) {}
     Vector3(TElement x, TElement y, TElement z) : items({x, y, z}) {}
+    Vector3(const TElement* items) : items({items[0], items[1], items[2]}) {}
 
     TElement& x() { return this->items[0]; }
     TElement& y() { return this->items[1]; }

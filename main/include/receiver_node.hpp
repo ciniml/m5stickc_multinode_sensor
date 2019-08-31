@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <map>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -29,63 +30,111 @@
 
 #include "espnow_packet.hpp"
 
-struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode>
+
+struct IMUData
+{
+    Vector3F acc;
+    Vector3F gyro;
+    Vector3F mag;
+
+    std::uint16_t max_fifo_usage;
+    std:chrono::microseconds timestamp;
+};
+
+template<typename TDerived>
+struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
 {
     static constexpr const char* TAG = "RECEIVER";
-    static constexpr std::size_t MAX_SENSOR_NODES = 10;
-    ESPNowAddress sensor_nodes[MAX_SENSOR_NODES];
-    std::size_t sensor_node_count;
+    typedef ReceiverNode<TDerived> ReceiverNodeType;
+    //static_assert(std::is_assignable<TDerived*, SelfType*>::value, "TDerived must inherit ReceivedNode<TDerived>" );
+
+    struct ConnectedSensorNode
+    {
+        enum class State
+        {
+            NotConnected,
+            Connecting,
+            Syncing,
+            Synced,
+            WaitingMeasurementResponse,
+            Measuring,
+        };
+        ESPNowAddress address;
+        std::chrono::microseconds last_time;
+        std::chrono::microseconds connection_response_time;
+        State state;
+
+        ConnectedSensorNode() : address(), last_time(0), connection_response_time(0), state(State::NotConnected) {}
+        ConnectedSensorNode(const ESPNowAddress& address) : address(address), last_time(0), state(State::NotConnected) {}
+    };
+
+    enum class State
+    {
+        Idle,
+        Connecting,
+        Connected,
+        RequestingMeasurement,
+        Measuring,
+    };
 
     freertos::WaitQueue<ESPNowCallbackEvent, 16> event_queue;
     freertos::Mutex running_lock;
     volatile bool running;
-    volatile bool connected;
+    volatile bool discovery_enabled;
+    volatile State state;
+    std::chrono::microseconds last_discovery_sent;
+    std::map<ESPNowAddress, ConnectedSensorNode> sensor_nodes;
 
-    static ReceiverNode* instance;
+    std::chrono::microseconds measurement_start_time;
+    
+    freertos::WaitQueue<IMUData, 32> imu_queue;
 
-    static std::uint64_t get_timestamp() 
+    static ReceiverNodeType* instance;
+
+    static std::chrono::microseconds get_timestamp() 
     {
-        return std::chrono::steady_clock::now().time_since_epoch().count();
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
     }
 
     static void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status)
     {
         if( instance != nullptr )  {
-            instance->event_queue.send(ESPNowCallbackEvent(ESPNowCallbackEventType::SendEvent, mac_addr, reinterpret_cast<const std::uint8_t*>(&status), sizeof(status)));
+            instance->event_queue.send(ESPNowCallbackEvent(ESPNowCallbackEventType::SendEvent, ESPNowAddress(mac_addr), reinterpret_cast<const std::uint8_t*>(&status), sizeof(status), get_timestamp()));
         }    
     }
     static void receive_callback(const uint8_t *mac_addr, const uint8_t *data, int len)
     {
         if( instance != nullptr )  {
-            instance->event_queue.send(ESPNowCallbackEvent(ESPNowCallbackEventType::ReceiveEvent, mac_addr, data, len));
+            instance->event_queue.send(ESPNowCallbackEvent(ESPNowCallbackEventType::ReceiveEvent, ESPNowAddress(mac_addr), data, len, get_timestamp()));
         }    
     }
 
-    ReceiverNode() : sensor_node_count(0), running(false), connected(false) {}
-
-    bool is_connected() const { return this->connected; }
-
-    bool add_sensor_node(const ESPNowAddress& sensor_node)
+    ReceiverNode() : running(false)
+                   , discovery_enabled(false)
+                   , state(State::Idle)
+                   , last_discovery_sent(0)
+                   , measurement_start_time(0)
     {
-        if( this->sensor_node_count == MAX_SENSOR_NODES ) {
-            return DNS_FALLBACK_SERVER_INDEX;
-        }
-        for(std::size_t i = 0; i < this->sensor_node_count; i++ ) {
-            if( this->sensor_nodes[i] == sensor_node ) {
-                return false;
-            }
-        }
-        this->sensor_nodes[this->sensor_node_count] = sensor_node;
-        this->sensor_node_count++;
-        return true;
     }
-    std::size_t get_sensor_node_count() const { return this->sensor_node_count; }
-    ESPNowAddress get_sensor_node(std::size_t index) const
+
+    TDerived& derived() { return static_cast<TDerived&>(*this); }
+
+    bool is_discovery_enabled() const { return this->discovery_enabled; }
+
+    void enable_discovery()
     {
-        if( index >= this->sensor_node_count ) {
-            return ESPNowAddress();
-        }
-        return this->sensor_nodes[index];
+        this->discovery_enabled = true;
+    }
+    void disable_discovery()
+    {
+        this->discovery_enabled = false;
+    }
+    
+    template<typename Typestamp>
+    void begin_measurement(Timestamp timestamp)
+    {
+        this->measurement_start_time = std::chrono::duration_cast<decltype(this->measurement_start_time)>(timestamp);
+        this->state = State::RequestingMeasurement;
     }
 
     Result<void, esp_err_t> start()
@@ -107,7 +156,7 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode>
         }
         {
             this->running = true;
-            auto result = ReceiverNode::SelfType::start("SENSOR", 3, APP_CPU_NUM);
+            auto result = ReceiverNode::SelfType::start("SENSOR", 2, APP_CPU_NUM);
             if( !result ) {
                 ESP_LOGE(TAG, "failed to start sensor task");
                 this->running = false;
@@ -132,19 +181,157 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode>
         }
     }
 
+    Result<void, esp_err_t> add_node(const ESPNowAddress& address)
+    {
+        esp_now_peer_info_t peer;
+        memset(&peer, 0, sizeof(peer));
+        peer.channel = 6;
+        peer.ifidx = ESP_IF_WIFI_AP;
+        peer.encrypt = false;
+        memcpy(peer.peer_addr, address.values, ESP_NOW_ETH_ALEN);
+        auto result = esp_now_add_peer(&peer);
+        if( result != ESP_OK ) {
+            ESP_LOGE(TAG, "failed to add node " MACSTR " - %x", MAC2STR(address.values), result);
+            return failure(result);
+        }
+        this->sensor_nodes.emplace(address, ConnectedSensorNode(address));
+        return success();
+    }
+
     void discovery_response_received(const ESPNowCallbackEvent& event)
     {
-        ESP_LOGI(TAG, "Sensor node " MACSTR " found", MAC2STR(event.address));
-        this->add_sensor_node(event.address);
+        ESP_LOGI(TAG, "Sensor node " MACSTR " found", MAC2STR(event.address.values));
+        if( this->discovery_enabled ) {
+            this->derived().on_discover(event.address);
+        }
+    }
+
+    void connect_sensor_node(ConnectedSensorNode& node)
+    {
+        auto timestamp = get_timestamp();
+        if( timestamp - node.last_time < std::chrono::seconds(1) ) {
+            return;
+        }
+        node.last_time = timestamp;
+
+        ESPNowPacket packet;
+        packet.magic = ESPNowPacket::MAGIC;
+        packet.sequence = 0;
+        packet.type = ESPNowPacketType::ConnectionRequest;
+        packet.set_timestamp(get_timestamp());
+        packet.reserved = 0;
+        packet.set_size_and_crc();
+        auto result = esp_now_send(node.address.values, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
+        if( result != ESP_OK ) {
+            ESP_LOGE(TAG, "send connect packet - %x", result);
+        }
+    }
+
+    void connection_response_received(const ESPNowCallbackEvent& event)
+    {
+        ESP_LOGI(TAG, "Connection response " MACSTR " received", MAC2STR(event.address.values));
+        auto it = this->sensor_nodes.find(event.address);
+        if( it == this->sensor_nodes.end() ) {
+            return;
+        }
+        it->second.connection_response_time = event.timestamp;
+        it->second.state = ConnectedSensorNode::State::Syncing;
+    }
+    
+    void sync_sensor_node(ConnectedSensorNode& node)
+    {
+        auto timestamp = get_timestamp();
+        if( timestamp - node.last_time < std::chrono::seconds(1) ) {
+            return;
+        }
+        node.last_time = timestamp;
+
+        ESPNowPacket packet;
+        packet.magic = ESPNowPacket::MAGIC;
+        packet.sequence = 0;
+        packet.type = ESPNowPacketType::NotifyDelay;
+        packet.set_timestamp(node.connection_response_time);
+        packet.reserved = 0;
+        packet.set_size_and_crc();
+        auto result = esp_now_send(node.address.values, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
+        if( result != ESP_OK ) {
+            ESP_LOGE(TAG, "send connect packet - %x", result);
+        }
+    }
+
+    void delay_response_received(const ESPNowCallbackEvent& event)
+    {
+        ESP_LOGI(TAG, "Delay response " MACSTR " received", MAC2STR(event.address.values));
+        auto it = this->sensor_nodes.find(event.address);
+        if( it == this->sensor_nodes.end() ) {
+            return;
+        }
+        it->second.state = ConnectedSensorNode::State::Synced;
+    }
+
+    void send_measurement_request(ConnectedSensorNode& node)
+    {
+        ESPNowPacket packet;
+        packet.magic = ESPNowPacket::MAGIC;
+        packet.sequence = 0;
+        packet.type = ESPNowPacketType::MeasurementRequest;
+        packet.set_timestamp(get_timestamp());
+        packet.reserved = 0;
+        packet.body.measurement_request.target_time = this->measurement_start_time.count();
+        packet.set_size_and_crc();
+        auto result = esp_now_send(node.address.values, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
+        if( result != ESP_OK ) {
+            ESP_LOGE(TAG, "send connect packet - %x", result);
+        }
+        else {
+            node.state = ConnectedSensorNode::State::WaitingMeasurementResponse;
+        }
+    }
+
+    void measurement_response_received(const ESPNowCallbackEvent& event)
+    {
+        ESP_LOGI(TAG, "Measurement response " MACSTR " received", MAC2STR(event.address.values));
+        auto it = this->sensor_nodes.find(event.address);
+        if( it == this->sensor_nodes.end() ) {
+            return;
+        }
+        it->second.state = ConnectedSensorNode::State::Measuring;
+    }
+
+    void sensor_data_received(const ESPNowCallbackEvent& event, const ESPNowPacket& packet)
+    {
+        ESP_LOGI(TAG, "Sensor data " MACSTR " received", MAC2STR(event.address.values));
+        auto it = this->sensor_nodes.find(event.address);
+        if( it == this->sensor_nodes.end() ) {
+            return;
+        }
+        
+        auto number_of_samples = packet.body.sensor_data.number_of_samples;
+        ESP_LOGI(TAG, "Number of samples = %d", number_of_samples);
+        for(std::uint8_t i = 0; i < number_of_samples; i++ ) {
+            const auto& sample = packet.body.sensor_data.samples[i];
+            IMUData imu_data;
+            imu_data.acc  = Vector3F(sample.acc);
+            imu_data.gyro = Vector3F(sample.gyro);
+            imu_data.mag  = Vector3F(sample.mag);
+            this->imu_queue.send(imu_data, freertos::to_ticks(std::chrono::milliseconds(1)));
+        }
+    }
+    void begin_connect()
+    {
+        this->state = State::Connecting;
+    }
+    bool is_connected() const
+    {
+        return this->state >= State::Connected;
     }
 
     void operator() ()
     {
-
         ESPNowCallbackEvent event;
         while(this->running)
         {
-            auto result = this->event_queue.receive(event, 0);
+            auto result = this->event_queue.receive(event, freertos::to_ticks(std::chrono::milliseconds(10)));
             if( result ) {
                 if( event.type == ESPNowCallbackEventType::ReceiveEvent ) {
                     auto& packet = *reinterpret_cast<ESPNowPacket*>(event.buffer);
@@ -159,18 +346,30 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode>
                         case ESPNowPacketType::DiscoveryResponse:
                             this->discovery_response_received(event);
                             break;
+                        case ESPNowPacketType::ConnectionResponse:
+                            this->connection_response_received(event);
+                            break;
+                        case ESPNowPacketType::DelayResponse:
+                            this->delay_response_received(event);
+                            break;
+                        case ESPNowPacketType::MeasurementResponse:
+                            this->measurement_response_received(event);
+                            break;
+                        case ESPNowPacketType::SensorData:
+                            this->sensor_data_received(event, packet);
                         default:
                             break;
                         }
                     }
                 }
             }
-            else {
+            if( this->discovery_enabled && get_timestamp() - this->last_discovery_sent >= std::chrono::seconds(1) )  {
+                this->last_discovery_sent = get_timestamp();
                 ESPNowPacket packet;
                 packet.magic = ESPNowPacket::MAGIC;
                 packet.sequence = 0;
                 packet.type = ESPNowPacketType::Discovery;
-                packet.timestamp = get_timestamp();
+                packet.set_timestamp(this->last_discovery_sent);
                 packet.reserved = 0;
                 packet.set_size_and_crc();
                 std::uint8_t mac_broadcast[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -178,9 +377,64 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode>
                 if( result != ESP_OK ) {
                     ESP_LOGE(TAG, "send error - %x", result);
                 }
-                else {
-                    freertos::Task::delay_ms(100);
+            }
+            switch(this->state) {
+            case State::Connecting: {
+                bool all_nodes_connected = true;
+                for( auto& pair : this->sensor_nodes ) {
+                    auto& node = pair.second;
+                    switch(node.state) {
+                    case ConnectedSensorNode::State::NotConnected:
+                    case ConnectedSensorNode::State::Connecting:
+                        this->connect_sensor_node(node);
+                        break;
+                    case ConnectedSensorNode::State::Syncing:
+                        this->sync_sensor_node(node);
+                        break;
+                    case ConnectedSensorNode::State::Synced:
+                        break;
+                    default:
+                        break;
+                    }
+
+                    if( node.state != ConnectedSensorNode::State::Synced ) {
+                        all_nodes_connected = false;
+                    }
                 }
+
+                if( all_nodes_connected ) {
+                    this->state = State::Connected;
+                }
+                break;
+            }
+            case State::RequestingMeasurement: {
+                bool all_nodes_responded = true;
+                for( auto& pair : this->sensor_nodes ) {
+                    auto& node = pair.second;
+                    switch(node.state) {
+                    case ConnectedSensorNode::State::Synced:
+                        this->send_measurement_request(node);
+                        break;
+                    case ConnectedSensorNode::State::WaitingMeasurementResponse:
+                        break;
+                    case ConnectedSensorNode::State::Measuring:
+                        break;
+                    default:
+                        break;
+                    }
+
+                    if( node.state != ConnectedSensorNode::State::Measuring ) {
+                        all_nodes_responded = false;
+                    }
+                }
+
+                if( all_nodes_responded ) {
+                    this->state = State::Measuring;
+                }
+                break;
+            }
+            default:
+                break;
             }
         }
         this->running_lock.release();
@@ -196,6 +450,5 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode>
     }
 };
 
-ReceiverNode* ReceiverNode::instance = nullptr;
 
 #endif //RECEIVER_NODE_HPP__

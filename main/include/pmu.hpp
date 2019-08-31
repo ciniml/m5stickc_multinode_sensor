@@ -44,13 +44,13 @@ private:
 
     static constexpr std::uint8_t TFT_OUTPUT_VALUE = 0x0c;  // TFT Output Voltage = 1.8 + 0.1*12 = 3.0[V]
 
-    static constexpr TickType_t DEFAULT_REG_TIMEOUT = pdMS_TO_TICKS(10);
+    static constexpr freertos::Ticks DEFAULT_REG_TIMEOUT = freertos::to_ticks(std::chrono::milliseconds(10));
 
-    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, freertos::Ticks wait_ticks=DEFAULT_REG_TIMEOUT)
     {
         return this->i2c.read_single_register(this->address, register_address, wait_ticks);
     }
-    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, freertos::Ticks wait_ticks=DEFAULT_REG_TIMEOUT)
     {
         return this->i2c.write_single_register(this->address, register_address, value, wait_ticks);
     }
@@ -169,8 +169,8 @@ public:
         uint8_t buffer[8];
         uint8_t adc_rate;
 
-        RESULT_TRY( this->i2c.read_register(this->address, AXP192_REG_ADC_RATE_TS_CONTROL, &adc_rate, 1, i2c_ack_type_t::I2C_MASTER_LAST_NACK) );
-        RESULT_TRY( this->i2c.read_register(this->address, AXP192_REG_COULOMB_COUNTER_CHARGE, buffer, 8, i2c_ack_type_t::I2C_MASTER_LAST_NACK) );
+        RESULT_TRY( this->i2c.read_register(this->address, AXP192_REG_ADC_RATE_TS_CONTROL, &adc_rate, 1, DEFAULT_REG_TIMEOUT) );
+        RESULT_TRY( this->i2c.read_register(this->address, AXP192_REG_COULOMB_COUNTER_CHARGE, buffer, 8, DEFAULT_REG_TIMEOUT) );
 
         std::int64_t charge = (static_cast<std::uint32_t>(buffer[0]) << 24)
                              | (static_cast<std::uint32_t>(buffer[1]) << 16)
@@ -235,5 +235,6 @@ public:
     }
 };
 
+constexpr freertos::Ticks PMU::DEFAULT_REG_TIMEOUT;
 
 #endif //PMU_HPP__

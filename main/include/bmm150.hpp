@@ -25,15 +25,15 @@ private:
     std::uint8_t address;
     bmm150_dev device;
 
-    static constexpr TickType_t DEFAULT_REG_TIMEOUT = pdMS_TO_TICKS(10);
+    static constexpr freertos::Ticks DEFAULT_REG_TIMEOUT = std::chrono::duration_cast<freertos::Ticks>(std::chrono::milliseconds(10));
 
     static constexpr const char* TAG = "BMM150";
 
-    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, freertos::Ticks wait_ticks=DEFAULT_REG_TIMEOUT)
     {
         return this->i2c.read_single_register(this->address, register_address, wait_ticks);
     }
-    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, freertos::Ticks wait_ticks=DEFAULT_REG_TIMEOUT)
     {
         return this->i2c.write_single_register(this->address, register_address, value, wait_ticks);
     }
@@ -108,5 +108,6 @@ public:
     }
 };
 
+constexpr freertos::Ticks BMM150::DEFAULT_REG_TIMEOUT;
 
 #endif //BMM150_HPP__

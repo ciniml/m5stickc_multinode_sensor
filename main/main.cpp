@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <map>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -41,21 +42,13 @@ static I2CMaster i2c_external(I2C_NUM_0);
 
 static PMU pmu(i2c_internal, 0x34);
 
-struct IMUData
-{
-    Vector3F acc;
-    Vector3F gyro;
-    Vector3F mag;
-
-    std::uint16_t max_fifo_usage;
-};
-
 class IMUTask : public freertos::StaticTask<8192, IMUTask>
 {
 private:
     static constexpr const char* TAG = "IMUTASK";
     static constexpr std::uint32_t NOTIFY_BIT_TIMER = 0x0001;
     static constexpr std::uint32_t NOTIFY_BIT_CLEAR_ERROR = 0x0002;
+    static constexpr std::uint32_t NOTIFY_BIT_START_MEASUREMENT = 0x0004;
 
     struct UpdateTimer : Timer<UpdateTimer>
     {
@@ -111,21 +104,29 @@ public:
             return false;
         }
 
-        auto result = this->update_timer.start(10000ul);
+        auto result = this->update_timer.start(std::chrono::microseconds(10000ul));
         if( !result ) {
             ESP_LOGE(TAG, "Failed to start IMU task timer - %x", result.error_code);
             return false;
         }
         return true;
     }
+
+    void start_measurement()
+    {
+        this->task().notify(NOTIFY_BIT_START_MEASUREMENT, eNotifyAction::eSetBits);
+    }
+
     void operator() ()
     {
         static IMU imu(i2c_internal, 0x68);
         static BMM150 magnetometer(i2c_external, 0x10);
         while(true)
         {
+            freertos::Task::notify_wait(0, NOTIFY_BIT_START_MEASUREMENT, freertos::MAX_DELAY);
+
             if( this->state == State::Error ) {
-                freertos::Task::notify_wait(0, NOTIFY_BIT_CLEAR_ERROR, portMAX_DELAY);
+                freertos::Task::notify_wait(0, NOTIFY_BIT_CLEAR_ERROR, freertos::MAX_DELAY);
             }
             std::uint8_t retry = 0;
             const std::uint8_t max_retry = 10;
@@ -160,7 +161,7 @@ public:
 
             ESP_LOGI(TAG, "IMU initialization completed.");
             this->state = State::Active;
-            while( freertos::Task::notify_wait(0, NOTIFY_BIT_TIMER, portMAX_DELAY).is_success ) {
+            while( freertos::Task::notify_wait(0, NOTIFY_BIT_TIMER, freertos::MAX_DELAY).is_success ) {
                 ESP_LOGV(TAG, "IMU sensor measurement begin");
                 IMUData imu_data;
                 imu_data.acc = Vector3F(0, 0, 0);
@@ -365,7 +366,7 @@ static void do_modeselecting()
         lcd.println("Receiver");
     }
 
-    while( auto event = buttons.read_event(pdMS_TO_TICKS(10)) ) {
+    while( auto event = buttons.read_event(freertos::to_ticks(std::chrono::milliseconds(10))) ) {
         if( event.value.type == Button::EventType::Pushed ) {
             if( event.value.position == Button::Position::B ) {
                 mode = mode ^ 1;
@@ -383,6 +384,7 @@ static void do_modeselecting()
 }
 
 static SensorNode sensor_node;
+static freertos::WaitEvent sensor_node_received_event;
 static void do_sensor_connecting()
 {
     static std::uint8_t mode = 0;
@@ -392,16 +394,62 @@ static void do_sensor_connecting()
     lcd.setTextColor(lcd.color565(255, 255, 255));
     
     lcd.println("Starting sensor node...");
-    check_fatal(sensor_node.start(), "failed to start sensor node");
+    check_fatal(sensor_node.start(&sensor_node_received_event), "failed to start sensor node");
+
+    if(! imu_task.start() ) {
+        fatal_error("Failed to start IMU task");
+    }
 
     lcd.println("Waiting connection...");
     while(!sensor_node.is_connected()) {
-        freertos::Task::delay_ms(10);
+        freertos::Task::delay_ms(50);
+    }
+
+    lcd.println("Waiting until target time...");
+    while( sensor_node.measurement_target_time - sensor_node.get_adjusted_timestamp() >= std::chrono::seconds(2) ) {
+        auto timestamp = sensor_node.get_adjusted_timestamp();
+        lcd.fillScreen(0);
+        lcd.setCursor(0, 0);
+        lcd.setTextColor(lcd.color565(255, 255, 255));
+        lcd.printf("%llu, %llu, %lld", timestamp.count(), SensorNode::get_timestamp().count(), sensor_node.time_offset.count());
+        freertos::Task::delay_ms(1000);
+    }
+    while( sensor_node.measurement_target_time > sensor_node.get_adjusted_timestamp() ); // Spin wait
+
+    imu_task.start_measurement();
+
+    main_state = MainState::SensorConnected;
+}
+
+static void do_sensor_connected()
+{
+    while( auto result = imu_task.receive() ) {
+        const auto& data = result.value;
+        sensor_node.send_sensor_data(data.timestamp, data.acc, data.gyro, data.mag);
     }
 }
 
 
-static ReceiverNode receiver_node;
+struct MyReceiverNode : public ReceiverNode<MyReceiverNode>
+{
+    freertos::Mutex discovered_devices_lock;
+    std::map<ESPNowAddress, bool> discovered_devices;
+
+    void add_device(const ESPNowAddress& address)
+    {
+        auto guard = freertos::lock(this->discovered_devices_lock);
+        if( this->discovered_devices.find(address) == this->discovered_devices.end() ) {
+            this->discovered_devices[address] = false;
+        }
+    }
+
+    void on_discover(const ESPNowAddress& address)
+    {
+        this->add_device(address);
+    }
+};
+template<> ReceiverNode<MyReceiverNode>* ReceiverNode<MyReceiverNode>::instance = nullptr;
+static MyReceiverNode receiver_node;
 static void do_receiver_connecting()
 {
     static std::uint8_t mode = 0;
@@ -413,10 +461,85 @@ static void do_receiver_connecting()
     lcd.println("Starting receiver node...");
     check_fatal(receiver_node.start(), "failed to start receiver node");
 
-    lcd.println("Waiting connection...");
-    while(!receiver_node.is_connected()) {
-        freertos::Task::delay_ms(10);
+    buttons.clear_events();
+
+    receiver_node.enable_discovery();
+
+    bool discovery_completed = false;
+    while(!discovery_completed) {
+        while( auto event = buttons.read_event(freertos::to_ticks(std::chrono::milliseconds(50))) ) {
+            if( event.value.type == Button::EventType::Pushed ) {
+                if( event.value.position == Button::Position::A ) {
+                    auto guard = freertos::lock(receiver_node.discovered_devices_lock);
+                    if( receiver_node.discovered_devices.size() > 0 ) {
+                        discovery_completed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Update device list
+        lcd.fillScreen(0);
+        lcd.setCursor(0, 0);
+        lcd.setTextColor(lcd.color565(255, 255, 255));
+        {
+            auto guard = freertos::lock(receiver_node.discovered_devices_lock);
+            for(const auto& pair : receiver_node.discovered_devices) {
+                lcd.printf(" " MACSTR "\n", MAC2STR(pair.first.values));
+            }
+        }
     }
+
+    receiver_node.disable_discovery();
+    {
+        auto guard = freertos::lock(receiver_node.discovered_devices_lock);
+        for(const auto& node : receiver_node.discovered_devices) {
+            receiver_node.add_node(node.first);
+        }
+    }
+    receiver_node.begin_connect();
+
+    lcd.fillScreen(0);
+    lcd.setCursor(0, 0);
+    lcd.setTextColor(lcd.color565(255, 255, 255));
+    lcd.println("Connecting to the sensor nodes...");
+    while(!receiver_node.is_connected()) {
+        freertos::Task::delay_ms(50);
+    }
+    main_state = MainState::ReceiverConnected;
+}
+
+static void do_receiver_connected()
+{
+    auto timestamp = MyReceiverNode::get_timestamp();
+    IMUData imu_data;
+    bool has_data = false;
+    while(receiver_node.imu_queue.receive(imu_data, freertos::to_ticks(std::chrono::milliseconds(50)))) {
+        ESP_LOGI(TAG, "sensor data: %0.2f, %0.2f, %0.2f", imu_data.acc.x_const(), imu_data.acc.y_const(), imu_data.acc.z_const());
+        has_data = true;
+    }
+    if( has_data ) {
+        lcd.fillScreen(0);
+        lcd.setCursor(0, 0);
+        lcd.setTextColor(lcd.color565(255, 255, 255));
+        lcd.printf("%llu\n", timestamp.count());
+        lcd.printf("acc: %0.1f, %0.1f, %0.1f\n"
+            , imu_data.acc.x_const()
+            , imu_data.acc.y_const()
+            , imu_data.acc.z_const()
+        );
+        lcd.printf("gyr: %0.1f, %0.1f, %0.1f\n"
+            , imu_data.gyro.x_const()
+            , imu_data.gyro.y_const()
+            , imu_data.gyro.z_const()
+        );
+        lcd.printf("mag: %0.1f, %0.1f, %0.1f\n"
+            , imu_data.mag.x_const()
+            , imu_data.mag.y_const()
+            , imu_data.mag.z_const()
+        );
+    }
+    freertos::Task::delay_ms(50);
 }
 
 
@@ -569,8 +692,16 @@ extern "C" void app_main(void)
             do_sensor_connecting();
             break;
 
+        case MainState::SensorConnected:
+            do_sensor_connected();
+            break;
+        
         case MainState::ReceiverConnecting:
             do_receiver_connecting();
+            break;
+        
+        case MainState::ReceiverConnected:
+            do_receiver_connected();
             break;
         
         case MainState::Testing:

@@ -172,14 +172,14 @@ public:
 
     i2c_port_t get_port() const { return this->port; }
 
-    Result<void, esp_err_t> execute(const I2CCommandLink& commands, TickType_t ticks_to_wait)
+    Result<void, esp_err_t> execute(const I2CCommandLink& commands, freertos::Ticks ticks_to_wait)
     {
         auto guard = freertos::lock(this->mutex, ticks_to_wait);
         if( !guard ) {
             return failure(ESP_ERR_TIMEOUT);
         }
 
-        auto result = i2c_master_cmd_begin(this->port, commands, ticks_to_wait);
+        auto result = i2c_master_cmd_begin(this->port, commands, ticks_to_wait.count());
         if( result != ESP_OK ) {
             return failure(result);
         }
@@ -187,7 +187,7 @@ public:
         return success();
     }
 
-    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t device_address, std::uint8_t register_address, TickType_t wait_ticks)
+    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t device_address, std::uint8_t register_address, freertos::Ticks wait_ticks)
     {
         I2CCommandLink commands;
         if( !commands ) {
@@ -202,7 +202,7 @@ public:
 
         return success<std::uint8_t>(buffer);
     }
-    Result<void, esp_err_t> read_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t* buffer, std::size_t length, TickType_t wait_ticks)
+    Result<void, esp_err_t> read_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t* buffer, std::size_t length, freertos::Ticks wait_ticks)
     {
         I2CCommandLink commands;
         if( !commands ) {
@@ -216,7 +216,7 @@ public:
 
         return success();
     }
-    Result<void, esp_err_t> write_single_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks)
+    Result<void, esp_err_t> write_single_register(std::uint8_t device_address, std::uint8_t register_address, std::uint8_t value, freertos::Ticks wait_ticks)
     {
         I2CCommandLink commands;
         if( !commands ) {
@@ -230,7 +230,7 @@ public:
 
         return success();
     }
-    Result<void, esp_err_t> write_register(std::uint8_t device_address, std::uint8_t register_address, const std::uint8_t* value, std::size_t length, TickType_t wait_ticks)
+    Result<void, esp_err_t> write_register(std::uint8_t device_address, std::uint8_t register_address, const std::uint8_t* value, std::size_t length, freertos::Ticks wait_ticks)
     {
         I2CCommandLink commands;
         if( !commands ) {

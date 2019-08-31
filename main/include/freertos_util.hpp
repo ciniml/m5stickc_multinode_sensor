@@ -4,6 +4,7 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <chrono>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,6 +16,14 @@
 
 namespace freertos
 {
+	typedef std::ratio<1, configTICK_RATE_HZ> TickRate;
+	typedef std::chrono::duration<TickType_t, TickRate> Ticks;
+
+	template<typename TDuration>
+	static constexpr Ticks to_ticks(TDuration duration) { return std::chrono::duration_cast<Ticks>(duration); }
+	
+	static constexpr Ticks MAX_DELAY(portMAX_DELAY);
+
 	class Mutex
 	{
 	private:
@@ -31,9 +40,9 @@ namespace freertos
 			xSemaphoreTake(this->handle, portMAX_DELAY);
 			this->is_locked = true;
 		}
-        bool lock(TickType_t wait_ticks)
+        bool lock(Ticks wait_ticks)
         {
-            if( xSemaphoreTake(this->handle, wait_ticks) == pdFALSE ) {
+            if( xSemaphoreTake(this->handle, wait_ticks.count()) == pdFALSE ) {
                 return false;
             }
             this->is_locked = true;
@@ -126,13 +135,13 @@ namespace freertos
 			return this->get_free_spaces() != 0;
 		}
 
-		bool send(const TItem& item, TickType_t wait_ticks = portMAX_DELAY)
+		bool send(const TItem& item, Ticks wait_ticks = MAX_DELAY)
 		{
-			return xQueueSend(this->handle.get(), &item, wait_ticks) == pdTRUE;
+			return xQueueSend(this->handle.get(), &item, wait_ticks.count()) == pdTRUE;
 		}
-		bool receive(TItem& received_item, TickType_t wait_ticks = portMAX_DELAY)
+		bool receive(TItem& received_item, Ticks wait_ticks = MAX_DELAY)
 		{
-			return xQueueReceive(this->handle.get(), &received_item, wait_ticks) == pdTRUE;
+			return xQueueReceive(this->handle.get(), &received_item, wait_ticks.count()) == pdTRUE;
 		}
 	};
 
@@ -153,7 +162,7 @@ namespace freertos
 		{
 			this->lock.lock();
 		}
-        LockGuard(TLock& lock, TickType_t wait_ticks) : own_lock(false), lock(lock)
+        LockGuard(TLock& lock, Ticks wait_ticks) : own_lock(false), lock(lock)
 		{
 			if( this->lock.lock(wait_ticks) ) {
                 this->own_lock = true;
@@ -184,7 +193,7 @@ namespace freertos
         operator bool() const { return this->own_lock; }
 	};
     template<typename TLock> LockGuard<TLock> lock(TLock& lock_primitive) { return LockGuard<TLock>(lock_primitive); }
-    template<typename TLock> LockGuard<TLock> lock(TLock& lock_primitive, TickType_t wait_ticks) { return LockGuard<TLock>(lock_primitive, wait_ticks); }
+    template<typename TLock> LockGuard<TLock> lock(TLock& lock_primitive, Ticks wait_ticks) { return LockGuard<TLock>(lock_primitive, wait_ticks); }
 
 	template<typename TResult> class future;
 
@@ -372,10 +381,10 @@ namespace freertos
 			return Task(xTaskGetCurrentTaskHandle());
 		}
 
-		static Result<std::uint32_t, bool> notify_wait(std::uint32_t bits_to_clear_on_entry, std::uint32_t bits_to_clear_on_exit, TickType_t ticks_to_wait)
+		static Result<std::uint32_t, bool> notify_wait(std::uint32_t bits_to_clear_on_entry, std::uint32_t bits_to_clear_on_exit, Ticks ticks_to_wait)
 		{
 			std::uint32_t notification_value = 0;
-			auto result = xTaskNotifyWait(bits_to_clear_on_entry, bits_to_clear_on_exit, &notification_value, ticks_to_wait);
+			auto result = xTaskNotifyWait(bits_to_clear_on_entry, bits_to_clear_on_exit, &notification_value, ticks_to_wait.count());
 			if( result != pdPASS ) {
 				return failure(true);
 			}

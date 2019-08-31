@@ -50,6 +50,15 @@
         "typeindex": "cpp",
         "typeinfo": "cpp",
         "utility": "cpp",
-        "variant": "cpp"
-    }
+        "variant": "cpp",
+        "*.ipp": "cpp",
+        "codecvt": "cpp",
+        "condition_variable": "cpp",
+        "csignal": "cpp",
+        "unordered_set": "cpp",
+        "future": "cpp",
+        "mutex": "cpp",
+        "numeric": "cpp"
+    },
+    "C_Cpp.errorSquiggles": "Disabled"
 }

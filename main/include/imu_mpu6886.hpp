@@ -33,7 +33,11 @@ public:
         G_8,
         G_16,
     };
-
+    struct SensorData
+    {
+        Vector3F acc;
+        Vector3F gyro;
+    };
 private:
     I2CMaster& i2c;
     std::uint8_t address;
@@ -41,9 +45,13 @@ private:
     AccelerometerFullScale accel_fullscale;
     GyroFullScale gyro_fullscale;
     
-    RingBuffer<Vector3I16, 64> acceleration_queue;
-    RingBuffer<Vector3I16, 64> angular_velocity_queue;
-    
+    struct RawSensorData
+    {
+        Vector3I16 acc;
+        Vector3I16 gyro;
+    };
+
+    RingBuffer<RawSensorData, 64> sensor_data_queue;
     RingBuffer<std::uint16_t, 16, true> fifo_counts;
     
     static constexpr std::uint8_t REG_SMPLRT_DIV = 25;
@@ -66,15 +74,15 @@ private:
 
     static constexpr std::uint8_t DEVICE_ID = 0x19;
 
-    static constexpr TickType_t DEFAULT_REG_TIMEOUT = pdMS_TO_TICKS(10);
+    static constexpr freertos::Ticks DEFAULT_REG_TIMEOUT = freertos::to_ticks(std::chrono::microseconds(10));
 
     static constexpr const char* TAG = "IMU";
 
-    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    Result<std::uint8_t, esp_err_t> read_single_register(std::uint8_t register_address, freertos::Ticks wait_ticks=DEFAULT_REG_TIMEOUT)
     {
         return this->i2c.read_single_register(this->address, register_address, wait_ticks);
     }
-    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, TickType_t wait_ticks=DEFAULT_REG_TIMEOUT)
+    Result<void, esp_err_t> write_single_register(std::uint8_t register_address, std::uint8_t value, freertos::Ticks wait_ticks=DEFAULT_REG_TIMEOUT)
     {
         return this->i2c.write_single_register(this->address, register_address, value, wait_ticks);
     }
@@ -196,8 +204,7 @@ public:
         
         ESP_LOGI(TAG, "Initialized");
 
-        this->acceleration_queue.reset();
-        this->angular_velocity_queue.reset();
+        this->sensor_data_queue.reset();
 
         return success();
     }
@@ -230,42 +237,34 @@ public:
                 return failure(ESP_ERR_NO_MEM);
             }
 
-            auto result = commands.read_register(this->address, REG_FIFO_R_W, buffer, sizeof(buffer), i2c_ack_type_t::I2C_MASTER_LAST_NACK)
-                .then([&commands, this]() { return this->i2c.execute(commands, DEFAULT_REG_TIMEOUT); });
-            if( !result ) {
-                return failure(result);
-            }
+            RESULT_TRY(commands.read_register(this->address, REG_FIFO_R_W, buffer, sizeof(buffer), i2c_ack_type_t::I2C_MASTER_LAST_NACK));
+            RESULT_TRY(this->i2c.execute(commands, DEFAULT_REG_TIMEOUT));
 
-            auto acceleration = Vector3I16(
+            RawSensorData sensor_data;
+            sensor_data.acc = Vector3I16(
                     static_cast<int16_t>((static_cast<uint16_t>(buffer[0+0]) << 8) | buffer[0+1]),
                     static_cast<int16_t>((static_cast<uint16_t>(buffer[0+2]) << 8) | buffer[0+3]),
                     static_cast<int16_t>((static_cast<uint16_t>(buffer[0+4]) << 8) | buffer[0+5]));
-            auto angular_velocity = Vector3I16(
+            sensor_data.gyro = Vector3I16(
                     static_cast<int16_t>((static_cast<uint16_t>(buffer[8+0]) << 8) | buffer[8+1]),
                     static_cast<int16_t>((static_cast<uint16_t>(buffer[8+2]) << 8) | buffer[8+3]),
                     static_cast<int16_t>((static_cast<uint16_t>(buffer[8+4]) << 8) | buffer[8+5]));
-            this->acceleration_queue.queue(acceleration);
-            this->angular_velocity_queue.queue(angular_velocity);
+            this->sensor_data_queue.queue(sensor_data);
         }
         return success();
     }
 
-    Result<Vector3F, bool> get_acceleration()
+    Result<SensorData, bool> get_sensor_data()
     {
-        auto result = this->acceleration_queue.dequeue();
+        auto result = this->sensor_data_queue.dequeue();
         if( !result ) {
             return failure(false);
         }
-        return success<Vector3F>(result.value * (this->get_accelerometer_fullscale_value()/32768.0f) );
-    }
-
-    Result<Vector3F, bool> get_angular_velocity()
-    {
-        auto result = this->angular_velocity_queue.dequeue();
-        if( !result ) {
-            return failure(false);
-        }
-        return success<Vector3F>(result.value * (this->get_gyro_fullscale_value()/32768.0f));
+        SensorData sensor_data = {
+            result.value.acc * (this->get_accelerometer_fullscale_value()/32768.0f),
+            result.value.gyro * (this->get_gyro_fullscale_value()/32768.0f),
+        };
+        return success<SensorData>(sensor_data);
     }
 
     std::uint16_t get_max_fifo_usage()
@@ -280,5 +279,6 @@ public:
     }
 };
 
+constexpr freertos::Ticks IMU::DEFAULT_REG_TIMEOUT;
 
 #endif //IMU_HPP__
