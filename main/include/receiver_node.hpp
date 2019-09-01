@@ -36,9 +36,13 @@ struct IMUData
     Vector3F acc;
     Vector3F gyro;
     Vector3F mag;
+    std::chrono::microseconds timestamp;
+};
 
-    std::uint16_t max_fifo_usage;
-    std:chrono::microseconds timestamp;
+struct SensorNodeIMUData
+{
+    ESPNowAddress address;
+    IMUData data;
 };
 
 template<typename TDerived>
@@ -46,6 +50,7 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
 {
     static constexpr const char* TAG = "RECEIVER";
     typedef ReceiverNode<TDerived> ReceiverNodeType;
+    
     //static_assert(std::is_assignable<TDerived*, SelfType*>::value, "TDerived must inherit ReceivedNode<TDerived>" );
 
     struct ConnectedSensorNode
@@ -63,10 +68,19 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
         std::chrono::microseconds last_time;
         std::chrono::microseconds connection_response_time;
         State state;
+        freertos::WaitQueue<IMUData, 32> imu_queue;
+        freertos::InterlockedValue<std::uint64_t> total_number_of_samples_received;
 
         ConnectedSensorNode() : address(), last_time(0), connection_response_time(0), state(State::NotConnected) {}
-        ConnectedSensorNode(const ESPNowAddress& address) : address(address), last_time(0), state(State::NotConnected) {}
+
+        std::uint64_t get_total_number_of_samples_received()
+        {
+            return this->total_number_of_samples_received;
+        }
     };
+
+    static constexpr std::size_t MAX_SENSOR_NODES = 3;
+    std::array<ConnectedSensorNode, MAX_SENSOR_NODES> sensor_nodes_body;
 
     enum class State
     {
@@ -83,12 +97,10 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
     volatile bool discovery_enabled;
     volatile State state;
     std::chrono::microseconds last_discovery_sent;
-    std::map<ESPNowAddress, ConnectedSensorNode> sensor_nodes;
+    std::map<ESPNowAddress, ConnectedSensorNode&> sensor_nodes;
 
     std::chrono::microseconds measurement_start_time;
     
-    freertos::WaitQueue<IMUData, 32> imu_queue;
-
     static ReceiverNodeType* instance;
 
     static std::chrono::microseconds get_timestamp() 
@@ -156,7 +168,7 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
         }
         {
             this->running = true;
-            auto result = ReceiverNode::SelfType::start("SENSOR", 2, APP_CPU_NUM);
+            auto result = ReceiverNode::SelfType::start("SENSOR", 3, APP_CPU_NUM);
             if( !result ) {
                 ESP_LOGE(TAG, "failed to start sensor task");
                 this->running = false;
@@ -183,6 +195,10 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
 
     Result<void, esp_err_t> add_node(const ESPNowAddress& address)
     {
+        if( this->sensor_nodes.size() >= this->sensor_nodes_body.size() ) {
+            ESP_LOGE(TAG, "failed to add node " MACSTR " - too many nodes.", MAC2STR(address.values));            
+            return failure(ESP_FAIL);
+        }
         esp_now_peer_info_t peer;
         memset(&peer, 0, sizeof(peer));
         peer.channel = 6;
@@ -194,7 +210,9 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
             ESP_LOGE(TAG, "failed to add node " MACSTR " - %x", MAC2STR(address.values), result);
             return failure(result);
         }
-        this->sensor_nodes.emplace(address, ConnectedSensorNode(address));
+        auto& sensor_node = this->sensor_nodes_body[this->sensor_nodes.size()];
+        sensor_node.address = address;
+        this->sensor_nodes.emplace(address, sensor_node);
         return success();
     }
 
@@ -300,22 +318,24 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
 
     void sensor_data_received(const ESPNowCallbackEvent& event, const ESPNowPacket& packet)
     {
-        ESP_LOGI(TAG, "Sensor data " MACSTR " received", MAC2STR(event.address.values));
+        ESP_LOGV(TAG, "Sensor data " MACSTR " received", MAC2STR(event.address.values));
         auto it = this->sensor_nodes.find(event.address);
         if( it == this->sensor_nodes.end() ) {
             return;
         }
         
         auto number_of_samples = packet.body.sensor_data.number_of_samples;
-        ESP_LOGI(TAG, "Number of samples = %d", number_of_samples);
+        ESP_LOGV(TAG, "Number of samples = %d", number_of_samples);
         for(std::uint8_t i = 0; i < number_of_samples; i++ ) {
             const auto& sample = packet.body.sensor_data.samples[i];
             IMUData imu_data;
             imu_data.acc  = Vector3F(sample.acc);
             imu_data.gyro = Vector3F(sample.gyro);
             imu_data.mag  = Vector3F(sample.mag);
-            this->imu_queue.send(imu_data, freertos::to_ticks(std::chrono::milliseconds(1)));
+            imu_data.timestamp = std::chrono::microseconds(packet.body.sensor_data.timestamp);
+            it->second.imu_queue.send(imu_data, freertos::to_ticks(std::chrono::milliseconds(1)));
         }
+        it->second.total_number_of_samples_received += number_of_samples;
     }
     void begin_connect()
     {
@@ -325,14 +345,28 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
     {
         return this->state >= State::Connected;
     }
+    
+    Result<SensorNodeIMUData, bool> get_sensor_data()
+    {
+        for(auto& pair : this->sensor_nodes ) {
+            IMUData data;
+            if(pair.second.imu_queue.receive(data, freertos::Ticks::zero())) {
+                SensorNodeIMUData node_data = {
+                    pair.first,
+                    data,
+                };
+                return success<SensorNodeIMUData>(node_data);
+            }
+        }
+        return failure(false);
+    }
 
     void operator() ()
     {
         ESPNowCallbackEvent event;
         while(this->running)
         {
-            auto result = this->event_queue.receive(event, freertos::to_ticks(std::chrono::milliseconds(10)));
-            if( result ) {
+            while(auto result = this->event_queue.receive(event, freertos::to_ticks(std::chrono::milliseconds(10)))) {
                 if( event.type == ESPNowCallbackEventType::ReceiveEvent ) {
                     auto& packet = *reinterpret_cast<ESPNowPacket*>(event.buffer);
                     auto validation_result = packet.validate();
@@ -340,7 +374,7 @@ struct ReceiverNode : public freertos::StaticTask<8192, ReceiverNode<TDerived> >
                         ESP_LOGE(TAG, "invalid packet - %d", static_cast<int>(validation_result.error_code));
                     }
                     else {
-                        ESP_LOGI(TAG, "packet %d received from " MACSTR, static_cast<int>(packet.type), MAC2STR(event.address));
+                        ESP_LOGV(TAG, "packet %d received from " MACSTR, static_cast<int>(packet.type), MAC2STR(event.address));
                         switch(packet.type)
                         {
                         case ESPNowPacketType::DiscoveryResponse:

@@ -21,7 +21,7 @@ namespace freertos
 
 	template<typename TDuration>
 	static constexpr Ticks to_ticks(TDuration duration) { return std::chrono::duration_cast<Ticks>(duration); }
-	
+
 	static constexpr Ticks MAX_DELAY(portMAX_DELAY);
 
 	class Mutex
@@ -113,11 +113,14 @@ namespace freertos
 		WaitQueueStorage<TItem, TLength> storage;
 		StaticQueue_t queue;
 	public:
+		typedef WaitQueue<TItem, TLength> SelfType;
 
 		WaitQueue() : handle(nullptr, &vQueueDelete)
 		{
 			this->handle.reset(xQueueCreateStatic(TLength, sizeof(TItem), this->storage.body, &this->queue));
 		}
+		WaitQueue(const SelfType&) = delete;
+				
 		void reset()
 		{
 			xQueueReset(this->handle.get());
@@ -194,6 +197,77 @@ namespace freertos
 	};
     template<typename TLock> LockGuard<TLock> lock(TLock& lock_primitive) { return LockGuard<TLock>(lock_primitive); }
     template<typename TLock> LockGuard<TLock> lock(TLock& lock_primitive, Ticks wait_ticks) { return LockGuard<TLock>(lock_primitive, wait_ticks); }
+
+	template<typename TValue, typename TLock = Mutex>
+	class InterlockedValue
+	{
+	private:
+		TLock value_lock;
+		TValue value;
+
+	public:
+		typedef InterlockedValue<TLock, TValue> SelfType;
+		InterlockedValue() = default;
+		InterlockedValue(const SelfType& obj) = delete;
+		InterlockedValue(const TValue& initial_value) : value(initial_value) {}
+
+		TValue get_value() {
+			auto lock_ = lock(this->value_lock);
+			return this->value; 
+		}
+		void set_value(const TValue& value) {
+			auto lock_ = lock(this->value_lock);
+			this->value = value;
+		}
+		void set_value(TValue&& value) {
+			auto lock_ = lock(this->value_lock);
+			this->value = std::forward<TValue>(value);
+		}
+
+		operator TValue() { return this->value; }
+		TValue operator=(const TValue& value) { this->set_value(value); return value; }
+		SelfType& operator=(TValue&& value) { this->set_value(std::forward<TValue>(value)); return *this; }
+
+		TValue operator+=(const TValue& rhs)
+		{
+			auto lock_ = lock(this->value_lock);
+			this->value += rhs;
+			return this->value;
+		}
+		TValue operator++()
+		{
+			auto lock_ = lock(this->value_lock);
+			return ++this->value;
+		}
+		TValue operator++(int)
+		{
+			auto lock_ = lock(this->value_lock);
+			return this->value++;
+		}
+		TValue operator-=(const TValue& rhs)
+		{
+			auto lock_ = lock(this->value_lock);
+			this->value -= rhs;
+			return this->value;
+		}
+		TValue operator--()
+		{
+			auto lock_ = lock(this->value_lock);
+			return --this->value;
+		}
+		TValue operator--(int)
+		{
+			auto lock_ = lock(this->value_lock);
+			return this->value--;
+		}
+
+		template<typename TFunc>
+		void locked(TFunc&& func) 
+		{
+			auto lock_ = lock(this->value_lock);
+			func(this->value);
+		}
+	};
 
 	template<typename TResult> class future;
 

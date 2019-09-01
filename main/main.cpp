@@ -50,6 +50,23 @@ private:
     static constexpr std::uint32_t NOTIFY_BIT_CLEAR_ERROR = 0x0002;
     static constexpr std::uint32_t NOTIFY_BIT_START_MEASUREMENT = 0x0004;
 
+    freertos::WaitQueue<IMUData, 256> imu_queue;
+    enum class State
+    {
+        NotStarted,
+        Initializing,
+        Active,
+        Error,
+    };
+    State state;
+    IMU imu;
+    BMM150 magnetometer;
+
+    static std::chrono::microseconds get_timestamp() 
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
+    }
+
     struct UpdateTimer : Timer<UpdateTimer>
     {
         IMUTask& task;
@@ -66,21 +83,37 @@ private:
         void enable() { this->enabled = true; }
         void disable() { this->enabled = false; }
     };
-
-    freertos::WaitQueue<IMUData, 10> imu_queue;
-    int imu_skip_counter = 0;
-    enum class State
+    struct MagnetometerTimer : Timer<MagnetometerTimer>
     {
-        NotStarted,
-        Initializing,
-        Active,
-        Error,
-    };
-    volatile State state = State::NotStarted;
-    UpdateTimer update_timer;
+        IMUTask& task;
+        freertos::InterlockedValue<Vector3F> value;
 
+        MagnetometerTimer(IMUTask& task) : task(task) {}
+        
+        void operator() () 
+        {
+            auto result = task.magnetometer.read();
+            if( !result ) {
+                ESP_LOGE(TAG, "Failed to read magnetometer");
+                return;
+            }
+
+            this->value.set_value(result.value);
+        }
+    };
+
+    
+    UpdateTimer update_timer;
+    MagnetometerTimer mag_timer;
 public:
-    IMUTask() : update_timer(*this) {}
+    IMUTask(I2CMaster& internal_i2c, I2CMaster& external_i2c) 
+        : state(State::NotStarted)
+        , imu(i2c_internal, 0x68)
+        , magnetometer(external_i2c, 0x10)
+        , update_timer(*this)
+        , mag_timer(*this) 
+    {
+    }
 
     void clear_error() 
     {
@@ -104,10 +137,19 @@ public:
             return false;
         }
 
-        auto result = this->update_timer.start(std::chrono::microseconds(10000ul));
-        if( !result ) {
-            ESP_LOGE(TAG, "Failed to start IMU task timer - %x", result.error_code);
-            return false;
+        {
+            auto result = this->update_timer.start(std::chrono::microseconds(10000ul));
+            if( !result ) {
+                ESP_LOGE(TAG, "Failed to start IMU task timer - %x", result.error_code);
+                return false;
+            }
+        }
+        {
+            auto result = this->mag_timer.start(std::chrono::microseconds(100000ul));
+            if( !result ) {
+                ESP_LOGE(TAG, "Failed to start magnetometer timer - %x", result.error_code);
+                return false;
+            }
         }
         return true;
     }
@@ -119,8 +161,6 @@ public:
 
     void operator() ()
     {
-        static IMU imu(i2c_internal, 0x68);
-        static BMM150 magnetometer(i2c_external, 0x10);
         while(true)
         {
             freertos::Task::notify_wait(0, NOTIFY_BIT_START_MEASUREMENT, freertos::MAX_DELAY);
@@ -161,56 +201,32 @@ public:
 
             ESP_LOGI(TAG, "IMU initialization completed.");
             this->state = State::Active;
+
             while( freertos::Task::notify_wait(0, NOTIFY_BIT_TIMER, freertos::MAX_DELAY).is_success ) {
                 ESP_LOGV(TAG, "IMU sensor measurement begin");
-                IMUData imu_data;
-                imu_data.acc = Vector3F(0, 0, 0);
-                imu_data.gyro = Vector3F(0, 0, 0);
-                imu_data.mag = Vector3F(0, 0, 0);
 
-                int acc_count = 0;
-                int gyro_count = 0;
-
-                // Read Magnetometer
-                auto result_mag = magnetometer.read();
-                if( !result_mag ) {
-                    ESP_LOGE(TAG, "Magnetometer update failed - %x", result_mag.error_code);
-                    continue;
-                }
                 // Read IMU sensor data via I2C
                 auto result = imu.update();
                 if( result ) {
-                    if( imu_skip_counter == 0 ) {
-                        imu_data.max_fifo_usage  = imu.get_max_fifo_usage();
+                    IMUData imu_data;
+                    //imu_data.max_fifo_usage  = imu.get_max_fifo_usage();
 
-                        while(auto acc = imu.get_acceleration()) {
-                            imu_data.acc += acc.value;
-                            acc_count++;
-                        }
-                        while(auto gyro = imu.get_angular_velocity()) {
-                            imu_data.gyro += gyro.value;
-                            gyro_count++;
-                        }
-                        if( acc_count > 0 ) {
-                            imu_data.acc /= acc_count;
-                        }
-                        if( gyro_count > 0 ) {
-                            imu_data.gyro /= gyro_count;
-                        }
-                        imu_data.mag = result_mag.value;
-
-                        ESP_LOGV(TAG, "IMU sensor measurement end. acc_count=%d, gyro_count=%d acc=%f,%f,%f gyro=%f,%f,%f mag=%f,%f,%f"
-                            , acc_count
-                            , gyro_count
+                    while(auto result = imu.get_sensor_data())
+                    {
+                        imu_data.acc = result.value.acc;
+                        imu_data.gyro = result.value.gyro;
+                        imu_data.mag = this->mag_timer.value.get_value();
+                        imu_data.timestamp = get_timestamp();
+                        ESP_LOGV(TAG, "IMU sensor measurement end. acc=%f,%f,%f gyro=%f,%f,%f mag=%f,%f,%f"
                             , imu_data.acc.x_const()
                             , imu_data.acc.y_const()
                             , imu_data.acc.z_const()
                             , imu_data.gyro.x_const()
                             , imu_data.gyro.y_const()
                             , imu_data.gyro.z_const()
-                            , result_mag.value.x_const()
-                            , result_mag.value.y_const()
-                            , result_mag.value.z_const()
+                            , imu_data.mag.x_const()
+                            , imu_data.mag.y_const()
+                            , imu_data.mag.z_const()
                         );
                         imu_queue.send(imu_data);
                     }
@@ -218,7 +234,6 @@ public:
                 else {
                     ESP_LOGE(TAG, "IMU update failed - %x", result.error_code);
                 }
-                imu_skip_counter = (imu_skip_counter+1) & 0x03;
             }
         }
     }
@@ -236,7 +251,7 @@ public:
 // Main Task
 static constexpr const char* TAG = "MAIN";
 
-static IMUTask imu_task;
+static IMUTask imu_task(i2c_internal, i2c_external);
 static Button buttons;
 static uint8_t s_example_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
@@ -423,9 +438,22 @@ static void do_sensor_connecting()
 
 static void do_sensor_connected()
 {
+    lcd.fillScreen(0);
+    lcd.setCursor(0, 0);
+    lcd.setTextColor(lcd.color565(255, 255, 255));
+    auto last_frame_updated = sensor_node.get_timestamp();
+
     while( auto result = imu_task.receive() ) {
         const auto& data = result.value;
-        sensor_node.send_sensor_data(data.timestamp, data.acc, data.gyro, data.mag);
+        sensor_node.send_sensor_data(data.timestamp + sensor_node.time_offset, data.acc, data.gyro, data.mag);
+        auto now = sensor_node.get_timestamp();
+        if( now - last_frame_updated >= std::chrono::milliseconds(50) ) {
+            last_frame_updated = now;
+            lcd.fillScreen(0);
+            lcd.setCursor(0, 0);
+            lcd.printf("max time: %0.2f [ms]\n", sensor_node.max_send_complete_elapsed.count()/1000.0f);
+            lcd.printf("avg time: %0.2f [ms]\n", sensor_node.average_send_complete_elapsed.count()/1000.0f);
+        }
     }
 }
 
@@ -512,10 +540,16 @@ static void do_receiver_connecting()
 static void do_receiver_connected()
 {
     auto timestamp = MyReceiverNode::get_timestamp();
-    IMUData imu_data;
+    SensorNodeIMUData imu_data;
     bool has_data = false;
-    while(receiver_node.imu_queue.receive(imu_data, freertos::to_ticks(std::chrono::milliseconds(50)))) {
-        ESP_LOGI(TAG, "sensor data: %0.2f, %0.2f, %0.2f", imu_data.acc.x_const(), imu_data.acc.y_const(), imu_data.acc.z_const());
+    while(auto result = receiver_node.get_sensor_data()) {
+        imu_data = result.value;
+        ESP_LOGV(TAG, "sensor data(" MACSTR "): %0.2f, %0.2f, %0.2f"
+            , MAC2STR(imu_data.address.values)
+            , imu_data.data.acc.x_const()
+            , imu_data.data.acc.y_const()
+            , imu_data.data.acc.z_const()
+        );
         has_data = true;
     }
     if( has_data ) {
@@ -523,22 +557,25 @@ static void do_receiver_connected()
         lcd.setCursor(0, 0);
         lcd.setTextColor(lcd.color565(255, 255, 255));
         lcd.printf("%llu\n", timestamp.count());
+        lcd.printf("%llu\n", imu_data.data.timestamp.count());
+        lcd.printf("node"  MACSTR "\n", MAC2STR(imu_data.address.values));
         lcd.printf("acc: %0.1f, %0.1f, %0.1f\n"
-            , imu_data.acc.x_const()
-            , imu_data.acc.y_const()
-            , imu_data.acc.z_const()
+            , imu_data.data.acc.x_const()
+            , imu_data.data.acc.y_const()
+            , imu_data.data.acc.z_const()
         );
         lcd.printf("gyr: %0.1f, %0.1f, %0.1f\n"
-            , imu_data.gyro.x_const()
-            , imu_data.gyro.y_const()
-            , imu_data.gyro.z_const()
+            , imu_data.data.gyro.x_const()
+            , imu_data.data.gyro.y_const()
+            , imu_data.data.gyro.z_const()
         );
         lcd.printf("mag: %0.1f, %0.1f, %0.1f\n"
-            , imu_data.mag.x_const()
-            , imu_data.mag.y_const()
-            , imu_data.mag.z_const()
+            , imu_data.data.mag.x_const()
+            , imu_data.data.mag.y_const()
+            , imu_data.data.mag.z_const()
         );
     }
+    //ESP_LOGI(TAG, "samples received: %llu", receiver_node.get_total_number_of_samples_received());
     freertos::Task::delay_ms(50);
 }
 
@@ -577,9 +614,9 @@ static void do_testing()
         , imu_data.mag.y_const()
         , imu_data.mag.z_const()
     );
-    lcd.printf("fifo: %d\n"
-        , imu_data.max_fifo_usage
-    );
+    // lcd.printf("fifo: %d\n"
+    //     , imu_data.max_fifo_usage
+    // );
 
     if( buttons.is_pressed(Button::Position::B) ) {
         {

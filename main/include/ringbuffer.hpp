@@ -65,7 +65,6 @@ public:
 
     bool is_empty() const { return this->read_index == this->write_index; }
     bool is_full() const { return (this->read_index ^ this->write_index) == Capacity; }
-
     bool queue(const TItem& item)
     {
         if( this->is_full() ) {

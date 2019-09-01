@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <numeric>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -43,6 +44,11 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     };
 
     freertos::WaitQueue<ESPNowCallbackEvent, 16> event_queue;
+    freertos::WaitQueue<esp_now_send_status_t, 1> send_event_queue;
+    RingBuffer<std::chrono::microseconds, 16, true> send_complete_elapsed;
+    std::chrono::microseconds average_send_complete_elapsed;
+    std::chrono::microseconds max_send_complete_elapsed;
+
     freertos::Mutex running_lock;
     volatile bool running;
     volatile State state;
@@ -68,7 +74,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     static void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status)
     {
         if( instance != nullptr )  {
-            instance->event_queue.send(ESPNowCallbackEvent(ESPNowCallbackEventType::SendEvent, ESPNowAddress(mac_addr), reinterpret_cast<const std::uint8_t*>(&status), sizeof(status), get_timestamp()));
+            instance->send_event_queue.send(status);
         }    
     }
     static void receive_callback(const uint8_t *mac_addr, const uint8_t *data, int len)
@@ -141,6 +147,32 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         }
     }
 
+    Result<void, esp_err_t> send_packet(const ESPNowAddress& address, const ESPNowPacket& packet, freertos::Ticks wait_ticks = freertos::to_ticks(std::chrono::milliseconds(1000))) 
+    {
+        auto start_time = get_timestamp();
+        this->send_event_queue.reset();
+        auto result = esp_now_send(address, reinterpret_cast<const std::uint8_t*>(&packet), packet.total_size());
+        if( result != ESP_OK ) {
+            return failure(result);
+        }
+        esp_now_send_status_t status;
+        auto wait_result = this->send_event_queue.receive(status, wait_ticks);
+        if( !wait_result ) {
+            return failure(ESP_ERR_TIMEOUT);
+        }
+        if( status != esp_now_send_status_t::ESP_NOW_SEND_SUCCESS ) {
+            return failure(ESP_FAIL);
+        }
+        auto elapsed = get_timestamp() - start_time;
+        this->send_complete_elapsed.queue(elapsed);
+        auto max_it = std::max_element(this->send_complete_elapsed.begin(), this->send_complete_elapsed.end());
+        if( max_it != this->send_complete_elapsed.end() ) {
+            this->max_send_complete_elapsed = *max_it;
+        }
+        this->average_send_complete_elapsed = std::accumulate(this->send_complete_elapsed.begin(), this->send_complete_elapsed.end(), std::chrono::microseconds::zero()) / 16;
+        return success();
+
+    }
     void discovery_received(const ESPNowCallbackEvent& event, const ESPNowPacket&)
     {
         // Add peer list
@@ -163,9 +195,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.set_timestamp(this->get_adjusted_timestamp());
         packet.reserved = 0;
         packet.set_size_and_crc();
-        auto result = esp_now_send(event.address, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
-        if( result != ESP_OK ) {
-            ESP_LOGE(TAG, "send error - %x", result);
+        auto result = this->send_packet(event.address, packet);
+        if( !result ) {
+            ESP_LOGE(TAG, "send error - %x", result.error_code);
         }
         else {
             ESP_LOGI(TAG, "send ok");
@@ -209,9 +241,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.set_timestamp(this->connection_response_send_time = this->get_adjusted_timestamp());
         packet.reserved = 0;
         packet.set_size_and_crc();
-        auto result = esp_now_send(this->receiver_address, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
-        if( result != ESP_OK ) {
-            ESP_LOGE(TAG, "send connection response packet - %x", result);
+        auto result = this->send_packet(this->receiver_address, packet);
+        if( !result ) {
+            ESP_LOGE(TAG, "send connection response packet - %x", result.error_code);
         }
     }
     void notify_delay_received(const ESPNowCallbackEvent& event, const ESPNowPacket& packet)
@@ -238,9 +270,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.set_timestamp(this->get_adjusted_timestamp());
         packet.reserved = 0;
         packet.set_size_and_crc();
-        auto result = esp_now_send(this->receiver_address, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
-        if( result != ESP_OK ) {
-            ESP_LOGE(TAG, "send connection response packet - %x", result);
+        auto result = this->send_packet(this->receiver_address, packet);
+        if( !result ) {
+            ESP_LOGE(TAG, "send connection response packet - %x", result.error_code);
         }
         else {
             this->state = State::Connected;
@@ -257,9 +289,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.set_timestamp(this->get_adjusted_timestamp());
         packet.reserved = 0;
         packet.set_size_and_crc();
-        auto result = esp_now_send(this->receiver_address, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
-        if( result != ESP_OK ) {
-            ESP_LOGE(TAG, "send measurement response packet - %x", result);
+        auto result = this->send_packet(this->receiver_address, packet);
+        if( !result ) {
+            ESP_LOGE(TAG, "send measurement response packet - %x", result.error_code);
         }
 
         this->measurement_target_time = std::chrono::microseconds(packet.body.measurement_request.target_time);
@@ -288,9 +320,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
             packet.set_timestamp(this->get_adjusted_timestamp());
             packet.reserved = 0;
             packet.set_size_and_crc();
-            auto result = esp_now_send(this->receiver_address, reinterpret_cast<std::uint8_t*>(&packet), packet.total_size());
-            if( result != ESP_OK ) {
-                ESP_LOGE(TAG, "send measurement response packet - %x", result);
+            auto result = this->send_packet(this->receiver_address, packet);
+            if( !result ) {
+                ESP_LOGE(TAG, "send sensor data packet - %x", result.error_code);
             }
             packet.body.sensor_data.number_of_samples = 0;
         }
