@@ -14,12 +14,8 @@
 #include <esp_err.h>
 #include <esp_timer.h>
 #include <esp_system.h>
-#include <esp_wifi.h>
-#include <esp_now.h>
-#include <esp_event_loop.h>
-#include <nvs_flash.h>
-#include <driver/i2c.h>
-#include <rom/crc.h>
+
+#include <lwip/udp.h>
 
 #include <freertos_util.hpp>
 #include <result.hpp>
@@ -27,7 +23,53 @@
 #include <ringbuffer.hpp>
 #include <vector3.hpp>
 
-enum class ESPNowPacketType : std::uint8_t
+
+#define IP2STR(a) (((a).u_addr.ip4.addr) & 0xff),(((a).u_addr.ip4.addr >> 8) & 0xff),(((a).u_addr.ip4.addr >> 16) & 0xff),(((a).u_addr.ip4.addr >> 24))
+#define IPSTR "%d.%d.%d.%d"
+
+
+struct SensorNodeAddress
+{
+    static SensorNodeAddress broadcast() { return SensorNodeAddress(IP4_ADDR_BROADCAST); }
+
+    ip_addr_t ip_address;
+    
+    SensorNodeAddress() = default;
+    SensorNodeAddress(const SensorNodeAddress& obj) : ip_address(obj.ip_address) {};
+    SensorNodeAddress(const ip_addr_t& ip_address) : ip_address(ip_address) {}
+    SensorNodeAddress(const ip_addr_t* ip_address) : ip_address(*ip_address) {}
+    SensorNodeAddress(const ip4_addr_t& ip_address) {
+        memset(&this->ip_address, 0, sizeof(this->ip_address));
+        this->ip_address.type = IPADDR_TYPE_V4;
+        this->ip_address.u_addr.ip4 = ip_address;
+    }
+    SensorNodeAddress(const ip4_addr_t* ip_address) : SensorNodeAddress(*ip_address) {}
+
+    bool equals(const ip_addr_t& ip_address) const 
+    {
+        return ip_addr_cmp(&this->ip_address, &ip_address); 
+    }
+
+    bool operator==(const SensorNodeAddress& rhs) const { return  this->equals(rhs.ip_address); }
+    bool operator!=(const SensorNodeAddress& rhs) const { return !this->equals(rhs.ip_address); }
+
+    operator const ip_addr_t*() const { return &this->ip_address; }
+    operator const ip_addr_t() const { return this->ip_address; }
+};
+
+
+namespace std {
+template<> struct hash<SensorNodeAddress>
+{
+    size_t operator()(const SensorNodeAddress& obj) const {
+        return obj.ip_address.type == IPADDR_TYPE_V4
+            ? obj.ip_address.u_addr.ip4.addr
+            : (obj.ip_address.u_addr.ip6.addr[0] ^ obj.ip_address.u_addr.ip6.addr[1] ^ obj.ip_address.u_addr.ip6.addr[2] ^ obj.ip_address.u_addr.ip6.addr[3]);
+    }
+};
+};
+
+enum class SensorNodePacketType : std::uint8_t
 {
     Discovery,
     DiscoveryResponse,
@@ -40,67 +82,16 @@ enum class ESPNowPacketType : std::uint8_t
     SensorData,
 };
 
-struct __attribute__((packed)) ESPNowAddress
-{
-    std::uint8_t values[ESP_NOW_ETH_ALEN];
 
-    ESPNowAddress() = default;
-    ESPNowAddress(const std::uint8_t* values)
-    {
-        memcpy(this->values, values, ESP_NOW_ETH_ALEN);
-    }
-    operator const std::uint8_t*() const
-    {
-        return this->values;
-    }
-    int compare(const ESPNowAddress& rhs) const
-    {
-        return memcmp(this->values, rhs.values, ESP_NOW_ETH_ALEN);
-    }
-    bool operator<(const ESPNowAddress& rhs) const
-    {
-        return this->compare(rhs) < 0;
-    }
-    bool operator<=(const ESPNowAddress& rhs) const
-    {
-        return this->compare(rhs) <= 0;
-    }
-    bool operator>(const ESPNowAddress& rhs) const
-    {
-        return this->compare(rhs) > 0;
-    }
-    bool operator>=(const ESPNowAddress& rhs) const
-    {
-        return this->compare(rhs) >= 0;
-    }
-    bool operator==(const ESPNowAddress& rhs) const
-    {
-        return this->compare(rhs) == 0;
-    }
-    bool operator!=(const ESPNowAddress& rhs) const
-    {
-        return !this->operator==(rhs);
-    }
-
-    void copy_from(const void* values)
-    {
-        memcpy(this->values, values, ESP_NOW_ETH_ALEN);
-    }
-    void copy_to(void* values) const
-    {
-        memcpy(values, this->values, ESP_NOW_ETH_ALEN);
-    }
-};
-
-struct __attribute__((packed)) ESPNowPacket
+struct __attribute__((packed)) SensorNodePacket
 {
     static constexpr std::uint16_t MAGIC = 0xBEEF;
     static constexpr std::size_t HEADER_SIZE = 16;
+    static constexpr std::size_t MAX_SENSOR_DATA_SAMPLES = 16;
     std::uint16_t magic;
-    ESPNowPacketType type;
+    SensorNodePacketType type;
     std::uint8_t reserved;
-    std::uint8_t sequence;
-    std::uint8_t size;
+    std::uint16_t size;
     std::uint16_t crc;
     std::uint64_t timestamp;
     union 
@@ -119,11 +110,16 @@ struct __attribute__((packed)) ESPNowPacket
                 float acc[3];
                 float gyro[3];
                 float mag[3];
-            } samples[4];
+            } samples[MAX_SENSOR_DATA_SAMPLES];
             template<typename Timestamp> void set_timestamp(Timestamp timestamp) { this->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(timestamp).count(); }
         } sensor_data;
     } body;
 
+    void copy(const SensorNodePacket& packet)
+    {
+        memcpy(this, &packet, HEADER_SIZE);
+        memcpy(&this->body, &packet.body, packet.size);
+    }
     std::chrono::microseconds timestamp_typed() const 
     {
         return std::chrono::microseconds(this->timestamp);
@@ -136,15 +132,15 @@ struct __attribute__((packed)) ESPNowPacket
     Result<std::size_t, bool> get_size_from_type() const 
     {
         switch(this->type) {
-        case ESPNowPacketType::Discovery:  return success<std::size_t>(0);
-        case ESPNowPacketType::DiscoveryResponse:  return success<std::size_t>(0);
-        case ESPNowPacketType::ConnectionRequest:  return success<std::size_t>(0);
-        case ESPNowPacketType::ConnectionResponse:  return success<std::size_t>(0);
-        case ESPNowPacketType::NotifyDelay:  return success<std::size_t>(0);
-        case ESPNowPacketType::DelayResponse:  return success<std::size_t>(0);
-        case ESPNowPacketType::MeasurementRequest:  return success(sizeof(this->body.measurement_request));
-        case ESPNowPacketType::MeasurementResponse:  return success<std::size_t>(0);
-        case ESPNowPacketType::SensorData: return success(sizeof(this->body.sensor_data));
+        case SensorNodePacketType::Discovery:  return success<std::size_t>(0);
+        case SensorNodePacketType::DiscoveryResponse:  return success<std::size_t>(0);
+        case SensorNodePacketType::ConnectionRequest:  return success<std::size_t>(0);
+        case SensorNodePacketType::ConnectionResponse:  return success<std::size_t>(0);
+        case SensorNodePacketType::NotifyDelay:  return success<std::size_t>(0);
+        case SensorNodePacketType::DelayResponse:  return success<std::size_t>(0);
+        case SensorNodePacketType::MeasurementRequest:  return success(sizeof(this->body.measurement_request));
+        case SensorNodePacketType::MeasurementResponse:  return success<std::size_t>(0);
+        case SensorNodePacketType::SensorData: return success(sizeof(this->body.sensor_data));
         default: return failure(false);
         }
     }
@@ -181,50 +177,6 @@ struct __attribute__((packed)) ESPNowPacket
         }
 
         return success();
-    }
-};
-
-enum class ESPNowCallbackEventType
-{
-    SendEvent,
-    ReceiveEvent,
-};
-struct ESPNowCallbackEvent
-{
-    static constexpr std::size_t FIXED_BUFFER_SIZE = sizeof(ESPNowPacket);
-    ESPNowCallbackEventType type;
-    std::uint8_t  buffer[FIXED_BUFFER_SIZE];
-    ESPNowAddress  address;
-    std::size_t   length;
-    std::chrono::microseconds timestamp;
-
-    ESPNowCallbackEvent() : length(0) {}
-
-    template<typename Timestamp>
-    ESPNowCallbackEvent(ESPNowCallbackEventType type, const ESPNowAddress& address, const std::uint8_t* data, std::size_t length, Timestamp timestamp) 
-         : type(type), address(address), length(0), timestamp(std::chrono::duration_cast<std::chrono::milliseconds>(timestamp))
-    {
-        if( length > FIXED_BUFFER_SIZE ) {
-            return;
-        }
-        memcpy(this->buffer, data, length);
-        this->length = length;
-    }
-
-
-    ESPNowCallbackEvent(const ESPNowCallbackEvent& obj) : type(obj.type), length(obj.length)
-    {
-        this->address.copy_from(obj.address);
-        memcpy(this->buffer, obj.buffer, obj.length);
-    }
-
-    ESPNowCallbackEvent& operator= (ESPNowCallbackEvent&& obj)
-    {
-        this->type = obj.type;
-        this->length = obj.length;
-        this->address = obj.address;
-        memcpy(this->buffer, obj.buffer, obj.length);
-        return *this;
     }
 };
 

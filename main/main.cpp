@@ -4,7 +4,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
-#include <map>
+#include <unordered_map>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -13,8 +13,7 @@
 #include <esp_timer.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
-#include <esp_now.h>
-#include <esp_event_loop.h>
+#include <esp_event.h>
 #include <nvs_flash.h>
 #include <driver/i2c.h>
 #include <rom/crc.h>
@@ -34,6 +33,8 @@
 #include <espnow_packet.hpp>
 #include <sensor_node.hpp>
 #include <receiver_node.hpp>
+
+static constexpr std::uint16_t SENSOR_NODE_PORT = 10010;
 
 static M5Display lcd;
 
@@ -253,7 +254,7 @@ static constexpr const char* TAG = "MAIN";
 
 static IMUTask imu_task(i2c_internal, i2c_external);
 static Button buttons;
-static uint8_t s_example_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+static freertos::WaitQueue<tcpip_adapter_ip_info_t, 1> wifi_sta_connected;
 
 enum class MainState
 {
@@ -308,16 +309,24 @@ static void do_fatal_error()
     }
 }
 
-static esp_err_t example_event_handler(void *ctx, system_event_t *event)
+static void receiver_event_handler(system_event_t* event);
+
+static esp_err_t system_event_handler(void *ctx, system_event_t *event)
 {
     switch(event->event_id) {
     case SYSTEM_EVENT_AP_START:
     case SYSTEM_EVENT_STA_START:
         ESP_LOGI(TAG, "WiFi started");
         break;
+    case SYSTEM_EVENT_STA_GOT_IP:
+        ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+        wifi_sta_connected.send(event->event_info.got_ip.ip_info, freertos::Ticks::zero());
+        break;
     default:
         break;
     }
+    receiver_event_handler(event);
+
     return ESP_OK;
 }
 
@@ -339,29 +348,14 @@ static void do_initializing()
     if( check_fatal(result, "failed to initialize NVS") ) return;
     
     // Initialize event handler
-    if( check_fatal(esp_event_loop_init(example_event_handler, nullptr), "failed to initialize event handler") ) return;
+    if( check_fatal(esp_event_loop_init(system_event_handler, nullptr), "failed to initialize event handler") ) return;
 
     // Initialize Wi-Fi
     tcpip_adapter_init();
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     if( check_fatal(esp_wifi_init(&wifi_cfg), "failed to initialize Wi-Fi (init)") ) return;
     if( check_fatal(esp_wifi_set_storage(WIFI_STORAGE_RAM), "failed to initialize Wi-Fi (storage)") ) return;
-    if( check_fatal(esp_wifi_set_mode(WIFI_MODE_AP), "failed to initialize Wi-Fi (ESPNOW)") ) return;
-    if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
-    if( check_fatal(esp_wifi_set_channel(6, wifi_second_chan_t::WIFI_SECOND_CHAN_NONE), "failed to initialize Wi-Fi (set channel)") ) return;
-    if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
-
-    // Initialize ESP-NOW
-    if( check_fatal(esp_now_init(), "ESP-NOW init") ) return;
-
-    esp_now_peer_info_t peer;
-    std::memset(&peer, 0, sizeof(peer));
-    peer.channel = 6;
-    peer.ifidx = ESP_IF_WIFI_AP;
-    peer.encrypt = false;
-    memcpy(peer.peer_addr, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
-    if( check_fatal(esp_now_add_peer(&peer), "ESP-NOW add broadcast peer") ) return;
-
+    
     main_state = MainState::ModeSelecting;
     buttons.clear_events();
 }
@@ -400,6 +394,7 @@ static void do_modeselecting()
 
 static SensorNode sensor_node;
 static freertos::WaitEvent sensor_node_received_event;
+static freertos::WaitEvent measurement_request_received_event;
 static void do_sensor_connecting()
 {
     static std::uint8_t mode = 0;
@@ -408,17 +403,31 @@ static void do_sensor_connecting()
     lcd.setCursor(0, 0);
     lcd.setTextColor(lcd.color565(255, 255, 255));
     
-    lcd.println("Starting sensor node...");
-    check_fatal(sensor_node.start(&sensor_node_received_event), "failed to start sensor node");
-
     if(! imu_task.start() ) {
         fatal_error("Failed to start IMU task");
     }
 
-    lcd.println("Waiting connection...");
-    while(!sensor_node.is_connected()) {
-        freertos::Task::delay_ms(50);
-    }
+    // Initialize Wi-Fi as STA mode.
+    if( check_fatal(esp_wifi_set_mode(WIFI_MODE_STA), "failed to initialize Wi-Fi (STA)") ) return;
+    if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    strcpy(reinterpret_cast<char*>(wifi_config.sta.ssid), "sensor-recv");
+    strcpy(reinterpret_cast<char*>(wifi_config.sta.password), "sensor-node");
+    if( check_fatal(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), "failed to set Wi-Fi config") ) return;
+    if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
+    
+    wifi_sta_connected.reset();
+    if( check_fatal(esp_wifi_connect(), "failed to connect to WI-Fi AP") ) return;
+    lcd.println("Waiting AP connection...");
+    tcpip_adapter_ip_info_t ip_info;
+    wifi_sta_connected.receive(ip_info);
+    
+    lcd.println("Starting sensor node...");
+    check_fatal(sensor_node.start(SensorNodeAddress(ip_info.gw), SENSOR_NODE_PORT, &measurement_request_received_event), "failed to start sensor node");
+    
+    lcd.println("Waiting measurement request...");
+    measurement_request_received_event.wait();
 
     lcd.println("Waiting until target time...");
     while( sensor_node.measurement_target_time - sensor_node.get_adjusted_timestamp() >= std::chrono::seconds(2) ) {
@@ -461,9 +470,9 @@ static void do_sensor_connected()
 struct MyReceiverNode : public ReceiverNode<MyReceiverNode>
 {
     freertos::Mutex discovered_devices_lock;
-    std::map<ESPNowAddress, bool> discovered_devices;
+    std::unordered_map<SensorNodeAddress, bool> discovered_devices;
 
-    void add_device(const ESPNowAddress& address)
+    void add_device(const SensorNodeAddress& address)
     {
         auto guard = freertos::lock(this->discovered_devices_lock);
         if( this->discovered_devices.find(address) == this->discovered_devices.end() ) {
@@ -471,13 +480,20 @@ struct MyReceiverNode : public ReceiverNode<MyReceiverNode>
         }
     }
 
-    void on_discover(const ESPNowAddress& address)
+    void on_discover(const SensorNodeAddress& address)
     {
         this->add_device(address);
     }
 };
-template<> ReceiverNode<MyReceiverNode>* ReceiverNode<MyReceiverNode>::instance = nullptr;
+
 static MyReceiverNode receiver_node;
+static void receiver_event_handler(system_event_t* event)
+{
+    if( receiver_node.is_discovery_enabled() ) {
+        receiver_node.handle_system_event(*event);
+    }
+}
+
 static void do_receiver_connecting()
 {
     static std::uint8_t mode = 0;
@@ -486,8 +502,22 @@ static void do_receiver_connecting()
     lcd.setCursor(0, 0);
     lcd.setTextColor(lcd.color565(255, 255, 255));
     
+    // Initialize Wi-Fi as AP mode.
+    if( check_fatal(esp_wifi_set_mode(WIFI_MODE_AP), "failed to initialize Wi-Fi as AP mode") ) return;
+    if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    strcpy(reinterpret_cast<char*>(wifi_config.ap.ssid), "sensor-recv");
+    strcpy(reinterpret_cast<char*>(wifi_config.ap.password), "sensor-node");
+    wifi_config.ap.ssid_len = strlen("sensor-recv");
+    wifi_config.ap.max_connection = 3;
+    wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    
+    if( check_fatal(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config), "failed to set Wi-Fi config") ) return;
+    if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
+
     lcd.println("Starting receiver node...");
-    check_fatal(receiver_node.start(), "failed to start receiver node");
+    check_fatal(receiver_node.start(SENSOR_NODE_PORT), "failed to start receiver node");
 
     buttons.clear_events();
 
@@ -513,7 +543,7 @@ static void do_receiver_connecting()
         {
             auto guard = freertos::lock(receiver_node.discovered_devices_lock);
             for(const auto& pair : receiver_node.discovered_devices) {
-                lcd.printf(" " MACSTR "\n", MAC2STR(pair.first.values));
+                lcd.printf(" " IPSTR "\n", IP2STR(pair.first.ip_address));
             }
         }
     }
@@ -534,6 +564,11 @@ static void do_receiver_connecting()
     while(!receiver_node.is_connected()) {
         freertos::Task::delay_ms(50);
     }
+
+    lcd.println("Connected to all sensor nodes.");
+    lcd.println("Measurement starts within 5 seconds.");
+    receiver_node.begin_measurement(MyReceiverNode::get_timestamp() + std::chrono::seconds(5));
+
     main_state = MainState::ReceiverConnected;
 }
 
@@ -544,8 +579,8 @@ static void do_receiver_connected()
     bool has_data = false;
     while(auto result = receiver_node.get_sensor_data()) {
         imu_data = result.value;
-        ESP_LOGV(TAG, "sensor data(" MACSTR "): %0.2f, %0.2f, %0.2f"
-            , MAC2STR(imu_data.address.values)
+        ESP_LOGV(TAG, "sensor data(" IPSTR "): %0.2f, %0.2f, %0.2f"
+            , IP2STR(imu_data.address.ip_address)
             , imu_data.data.acc.x_const()
             , imu_data.data.acc.y_const()
             , imu_data.data.acc.z_const()
@@ -558,7 +593,7 @@ static void do_receiver_connected()
         lcd.setTextColor(lcd.color565(255, 255, 255));
         lcd.printf("%llu\n", timestamp.count());
         lcd.printf("%llu\n", imu_data.data.timestamp.count());
-        lcd.printf("node"  MACSTR "\n", MAC2STR(imu_data.address.values));
+        lcd.printf("node"  IPSTR "\n", IP2STR(imu_data.address.ip_address));
         lcd.printf("acc: %0.1f, %0.1f, %0.1f\n"
             , imu_data.data.acc.x_const()
             , imu_data.data.acc.y_const()

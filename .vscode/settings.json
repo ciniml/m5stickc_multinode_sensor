@@ -58,7 +58,10 @@
         "unordered_set": "cpp",
         "future": "cpp",
         "mutex": "cpp",
-        "numeric": "cpp"
+        "numeric": "cpp",
+        "esp_event_legacy.h": "c",
+        "esp_event_loop.h": "c",
+        "esp_event.h": "c"
     },
     "C_Cpp.errorSquiggles": "Disabled"
 }

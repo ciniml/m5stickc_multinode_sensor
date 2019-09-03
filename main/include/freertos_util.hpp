@@ -87,9 +87,9 @@ namespace freertos
 		{
 			xEventGroupSetBits(this->handle.get(), 1);
 		}
-		void wait(bool clear_on_exit=false)
+		void wait(bool clear_on_exit=false, Ticks wait_ticks = MAX_DELAY)
 		{
-			xEventGroupWaitBits(this->handle.get(), 1, clear_on_exit ? pdTRUE : pdFALSE, pdTRUE, portMAX_DELAY);
+			xEventGroupWaitBits(this->handle.get(), 1, clear_on_exit ? pdTRUE : pdFALSE, pdTRUE, wait_ticks.count());
 		}
 		bool is_valid() const { return this->handle.operator bool(); }
 	};
