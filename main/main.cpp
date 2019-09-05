@@ -412,8 +412,8 @@ static void do_sensor_connecting()
     if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
-    strcpy(reinterpret_cast<char*>(wifi_config.sta.ssid), "sensor-recv");
-    strcpy(reinterpret_cast<char*>(wifi_config.sta.password), "sensor-node");
+    strcpy(reinterpret_cast<char*>(wifi_config.sta.ssid), SENSOR_NODE_AP_SSID);
+    strcpy(reinterpret_cast<char*>(wifi_config.sta.password), SENSOR_NODE_AP_PASSWORD);
     if( check_fatal(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), "failed to set Wi-Fi config") ) return;
     if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
     
@@ -507,9 +507,9 @@ static void do_receiver_connecting()
     if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
-    strcpy(reinterpret_cast<char*>(wifi_config.ap.ssid), "sensor-recv");
-    strcpy(reinterpret_cast<char*>(wifi_config.ap.password), "sensor-node");
-    wifi_config.ap.ssid_len = strlen("sensor-recv");
+    strcpy(reinterpret_cast<char*>(wifi_config.ap.ssid), SENSOR_NODE_AP_SSID);
+    strcpy(reinterpret_cast<char*>(wifi_config.ap.password), SENSOR_NODE_AP_PASSWORD);
+    wifi_config.ap.ssid_len = strlen(SENSOR_NODE_AP_SSID);
     wifi_config.ap.max_connection = 3;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     

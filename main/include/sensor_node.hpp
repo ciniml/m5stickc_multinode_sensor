@@ -123,10 +123,10 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         this->running = false;
     }
 
-    Result<void, esp_err_t> send_packet(const SensorNodePacket& packet, freertos::Ticks wait_ticks = freertos::to_ticks(std::chrono::milliseconds(1000))) 
+    Result<void, esp_err_t> send_packet(const SensorNodePacket& packet, const SensorNodeAddress* address = nullptr, freertos::Ticks wait_ticks = freertos::to_ticks(std::chrono::milliseconds(1000))) 
     {
         auto start_time = get_timestamp();
-        auto result = this->communication.send(PBufPacket(packet), this->address);
+        auto result = this->communication.send(PBufPacket(packet), address != nullptr ? *address : this->address);
         if( !result ) {
             return failure(ESP_FAIL);
         }
@@ -142,13 +142,14 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     }
     void discovery_received(const PBufPacket& raw_packet, const SensorNodePacket&)
     {
+        ESP_LOGI(TAG, "Discovery from " IPSTR " received", IP2STR(raw_packet.address.ip_address));
         SensorNodePacket packet;
         packet.magic = SensorNodePacket::MAGIC;
         packet.type = SensorNodePacketType::DiscoveryResponse;
         packet.set_timestamp(this->get_adjusted_timestamp());
         packet.reserved = 0;
         packet.set_size_and_crc();
-        auto result = this->send_packet(packet);
+        auto result = this->send_packet(packet, &raw_packet.address);
         if( !result ) {
             ESP_LOGE(TAG, "send error - %x", result.error_code);
         }
@@ -160,7 +161,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     
     void connection_request_received(const PBufPacket& raw_packet, const SensorNodePacket& packet)
     {
-        ESP_LOGI(TAG, "Connection request from " IPSTR " received", IP2STR(raw_packet.address.ip_address));
+        ESP_LOGI(TAG, "Connection request from " IPSTR " received, timestamp=%llu", IP2STR(raw_packet.address.ip_address), packet.timestamp);
         this->connection_request_timestamp = packet.timestamp_typed();
         this->connection_request_received_time = raw_packet.timestamp + this->time_offset;
         this->address = raw_packet.address;
@@ -184,11 +185,11 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         if( !result ) {
             ESP_LOGE(TAG, "send connection response packet - %x", result.error_code);
         }
-        ESP_LOGI(TAG, "Sent connection response");
+        ESP_LOGI(TAG, "Sent connection response, timestamp=%llu", packet.timestamp);
     }
     void notify_delay_received(const PBufPacket& raw_packet, const SensorNodePacket& packet)
     {
-        ESP_LOGI(TAG, "Notify delay from " IPSTR " received", IP2STR(raw_packet.address.ip_address));
+        ESP_LOGI(TAG, "Notify delay from " IPSTR " received, timestamp=%llu", IP2STR(raw_packet.address.ip_address), packet.timestamp);
         this->notify_delay_timestamp = packet.timestamp_typed() + this->time_offset;
         this->state = State::Syncing;
         this->last_send_time = std::chrono::microseconds::zero();

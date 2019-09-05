@@ -103,7 +103,7 @@ struct __attribute__((packed)) SensorNodePacket
         struct 
         {
             std::uint8_t number_of_samples;
-            std::uint8_t reserved[3];
+            std::uint8_t reserved[7];
             std::uint64_t timestamp;
             struct 
             {
@@ -147,7 +147,7 @@ struct __attribute__((packed)) SensorNodePacket
     void set_size_and_crc()
     {
         this->size = this->get_size_from_type().unwrap_or(0);
-        this->crc  = crc16_le(0, reinterpret_cast<const std::uint8_t*>(&this->body), this->size);
+        this->crc  = static_cast<std::uint16_t>(~crc16_le(0xffff, reinterpret_cast<const std::uint8_t*>(&this->body), this->size));
     }
 
     std::size_t total_size() const { return this->size + HEADER_SIZE; }
@@ -171,10 +171,11 @@ struct __attribute__((packed)) SensorNodePacket
         if( this->size != expected_size.value ) {
             return failure(ValidateError::UnexpectedSize);
         }
-        auto crc  = crc16_le(0, reinterpret_cast<const std::uint8_t*>(&this->body), expected_size.value);
-        if( this->crc != crc ) {
-            return failure(ValidateError::CRCMismatch);
-        }
+        //auto crc  = static_cast<std::uint16_t>(~crc16_le(0xffff, reinterpret_cast<const std::uint8_t*>(&this->body), expected_size.value));
+        //if( this->crc != crc ) {
+        //    ESP_LOGE("PACKET", "CRC error expected=%04x, actual=%04x", crc, this->crc);
+        //    return failure(ValidateError::CRCMismatch);
+        //}
 
         return success();
     }
