@@ -96,11 +96,17 @@ struct __attribute__((packed)) SensorNodePacket
     std::uint64_t timestamp;
     union 
     {
-        struct
+        struct __attribute__((packed))
+        {
+            std::uint8_t mac_address[6];
+            std::uint8_t name_length;
+            char name[32];
+        } discovery_response;
+        struct __attribute__((packed))
         {
             std::uint64_t target_time;
         } measurement_request;
-        struct 
+        struct __attribute__((packed))
         {
             std::uint8_t number_of_samples;
             std::uint8_t reserved[7];
@@ -133,9 +139,9 @@ struct __attribute__((packed)) SensorNodePacket
     {
         switch(this->type) {
         case SensorNodePacketType::Discovery:  return success<std::size_t>(0);
-        case SensorNodePacketType::DiscoveryResponse:  return success<std::size_t>(0);
+        case SensorNodePacketType::DiscoveryResponse:  return success(sizeof(this->body.discovery_response));
         case SensorNodePacketType::ConnectionRequest:  return success<std::size_t>(0);
-        case SensorNodePacketType::ConnectionResponse:  return success<std::size_t>(0);
+        case SensorNodePacketType::ConnectionResponse:  return success(sizeof(this->body.discovery_response));
         case SensorNodePacketType::NotifyDelay:  return success<std::size_t>(0);
         case SensorNodePacketType::DelayResponse:  return success<std::size_t>(0);
         case SensorNodePacketType::MeasurementRequest:  return success(sizeof(this->body.measurement_request));

@@ -51,7 +51,7 @@ private:
     static constexpr std::uint32_t NOTIFY_BIT_CLEAR_ERROR = 0x0002;
     static constexpr std::uint32_t NOTIFY_BIT_START_MEASUREMENT = 0x0004;
 
-    freertos::WaitQueue<IMUData, 256> imu_queue;
+    freertos::WaitQueue<IMUData, 128> imu_queue;
     enum class State
     {
         NotStarted,
@@ -417,6 +417,9 @@ static void do_sensor_connecting()
     if( check_fatal(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), "failed to set Wi-Fi config") ) return;
     if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
     
+    std::uint8_t mac_address[6];
+    if( check_fatal( esp_wifi_get_mac(WIFI_IF_STA, mac_address), "Failed to get MAC address") ) return;
+
     wifi_sta_connected.reset();
     if( check_fatal(esp_wifi_connect(), "failed to connect to WI-Fi AP") ) return;
     lcd.println("Waiting AP connection...");
@@ -424,21 +427,21 @@ static void do_sensor_connecting()
     wifi_sta_connected.receive(ip_info);
     
     lcd.println("Starting sensor node...");
-    check_fatal(sensor_node.start(SensorNodeAddress(ip_info.gw), SENSOR_NODE_PORT, &measurement_request_received_event), "failed to start sensor node");
+    check_fatal(sensor_node.start(SensorNodeAddress(ip_info.gw), SENSOR_NODE_PORT, mac_address, "sensor_node", &measurement_request_received_event), "failed to start sensor node");
     
     lcd.println("Waiting measurement request...");
     measurement_request_received_event.wait();
 
     lcd.println("Waiting until target time...");
-    while( sensor_node.measurement_target_time - sensor_node.get_adjusted_timestamp() >= std::chrono::seconds(2) ) {
+    while( sensor_node.get_measurement_target_time() - sensor_node.get_adjusted_timestamp() >= std::chrono::seconds(2) ) {
         auto timestamp = sensor_node.get_adjusted_timestamp();
         lcd.fillScreen(0);
         lcd.setCursor(0, 0);
         lcd.setTextColor(lcd.color565(255, 255, 255));
-        lcd.printf("%llu, %llu, %lld", timestamp.count(), SensorNode::get_timestamp().count(), sensor_node.time_offset.count());
+        lcd.printf("%llu, %llu, %lld", sensor_node.get_measurement_target_time().count(), timestamp.count(), (sensor_node.get_measurement_target_time() - timestamp).count());
         freertos::Task::delay_ms(1000);
     }
-    while( sensor_node.measurement_target_time > sensor_node.get_adjusted_timestamp() ); // Spin wait
+    while( sensor_node.measurement_target_time < sensor_node.get_adjusted_timestamp() ); // Spin wait
 
     imu_task.start_measurement();
 
@@ -456,7 +459,7 @@ static void do_sensor_connected()
         const auto& data = result.value;
         sensor_node.send_sensor_data(data.timestamp + sensor_node.time_offset, data.acc, data.gyro, data.mag);
         auto now = sensor_node.get_timestamp();
-        if( now - last_frame_updated >= std::chrono::milliseconds(50) ) {
+        if( now - last_frame_updated >= std::chrono::milliseconds(500) ) {
             last_frame_updated = now;
             lcd.fillScreen(0);
             lcd.setCursor(0, 0);

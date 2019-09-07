@@ -54,7 +54,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     State state;
     SensorNodeAddress address;
     std::uint16_t port;
-    
+    std::uint8_t mac_address[6];
+    char name[32];
+
     std::chrono::microseconds connection_request_timestamp;
     std::chrono::microseconds connection_request_received_time;
     std::chrono::microseconds connection_response_send_time;
@@ -88,11 +90,16 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     {
         return get_timestamp() + this->time_offset;
     }
+    std::chrono::microseconds get_measurement_target_time() const
+    {
+        return this->measurement_target_time;
+    }
 
-    Result<void, esp_err_t> start(const SensorNodeAddress& address, std::uint16_t port, freertos::WaitEvent* measurement_requested_event)
+    Result<void, esp_err_t> start(const SensorNodeAddress& address, std::uint16_t port, const std::uint8_t* mac_address, const char* name, freertos::WaitEvent* measurement_requested_event)
     {
         ESP_LOGI(TAG, "Starting Sensor node receiver addr:" IPSTR " port:%d", IP2STR(address.ip_address), port);
-
+        memcpy(this->mac_address, mac_address, 6);
+        strcpy(reinterpret_cast<char*>(this->name), name);
         this->address = address;
         this->port = port;
         {
@@ -148,6 +155,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.type = SensorNodePacketType::DiscoveryResponse;
         packet.set_timestamp(this->get_adjusted_timestamp());
         packet.reserved = 0;
+        memcpy(packet.body.discovery_response.mac_address, this->mac_address, 6);
+        strcpy(packet.body.discovery_response.name, this->name);
+        packet.body.discovery_response.name_length = strlen(this->name);
         packet.set_size_and_crc();
         auto result = this->send_packet(packet, &raw_packet.address);
         if( !result ) {
@@ -180,6 +190,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.type = SensorNodePacketType::ConnectionResponse;
         packet.set_timestamp(this->connection_response_send_time = this->get_adjusted_timestamp());
         packet.reserved = 0;
+        memcpy(packet.body.discovery_response.mac_address, this->mac_address, 6);
+        strcpy(packet.body.discovery_response.name, this->name);
+        packet.body.discovery_response.name_length = strlen(this->name);
         packet.set_size_and_crc();
         auto result = this->send_packet(packet);
         if( !result ) {
@@ -209,6 +222,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         packet.type = SensorNodePacketType::DelayResponse;
         packet.set_timestamp(this->get_adjusted_timestamp());
         packet.reserved = 0;
+        memcpy(packet.body.discovery_response.mac_address, this->mac_address, 6);
+        strcpy(packet.body.discovery_response.name, this->name);
+        packet.body.discovery_response.name_length = strlen(this->name);
         packet.set_size_and_crc();
         auto result = this->send_packet(packet);
         if( !result ) {
@@ -221,6 +237,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     void measurement_request_received(const PBufPacket& raw_packet, const SensorNodePacket& packet_received)
     {
         ESP_LOGI(TAG, "Measurement request from " IPSTR " received", IP2STR(raw_packet.address.ip_address));
+        this->measurement_target_time = std::chrono::microseconds(packet_received.body.measurement_request.target_time);
         
         SensorNodePacket packet;
         packet.magic = SensorNodePacket::MAGIC;
@@ -233,7 +250,6 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
             ESP_LOGE(TAG, "send measurement response packet - %x", result.error_code);
         }
 
-        this->measurement_target_time = std::chrono::microseconds(packet.body.measurement_request.target_time);
         if( this->measurement_requested_event != nullptr ) {
             this->measurement_requested_event->set();
         }
