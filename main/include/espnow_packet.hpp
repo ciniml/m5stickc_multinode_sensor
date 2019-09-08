@@ -80,6 +80,8 @@ enum class SensorNodePacketType : std::uint8_t
     MeasurementRequest,
     MeasurementResponse,
     SensorData,
+    SyncRequest,
+    SyncResponse,
 };
 
 
@@ -106,6 +108,10 @@ struct __attribute__((packed)) SensorNodePacket
         {
             std::uint64_t target_time;
         } measurement_request;
+        struct __attribute__((packed))
+        {
+            std::uint8_t target_mac[6];
+        } sync_request;
         struct __attribute__((packed))
         {
             std::uint8_t number_of_samples;
@@ -142,6 +148,8 @@ struct __attribute__((packed)) SensorNodePacket
         case SensorNodePacketType::DiscoveryResponse:  return success(sizeof(this->body.discovery_response));
         case SensorNodePacketType::ConnectionRequest:  return success<std::size_t>(0);
         case SensorNodePacketType::ConnectionResponse:  return success(sizeof(this->body.discovery_response));
+        case SensorNodePacketType::SyncRequest:  return success<std::size_t>(sizeof(this->body.sync_request));
+        case SensorNodePacketType::SyncResponse:  return success<std::size_t>(0);
         case SensorNodePacketType::NotifyDelay:  return success<std::size_t>(0);
         case SensorNodePacketType::DelayResponse:  return success<std::size_t>(0);
         case SensorNodePacketType::MeasurementRequest:  return success(sizeof(this->body.measurement_request));
@@ -152,6 +160,7 @@ struct __attribute__((packed)) SensorNodePacket
     }
     void set_size_and_crc()
     {
+        this->magic = MAGIC;
         this->size = this->get_size_from_type().unwrap_or(0);
         this->crc  = static_cast<std::uint16_t>(~crc16_le(0xffff, reinterpret_cast<const std::uint8_t*>(&this->body), this->size));
     }

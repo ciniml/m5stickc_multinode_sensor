@@ -62,6 +62,10 @@ private:
     static constexpr std::uint8_t REG_FIFO_EN = 35;
     static constexpr std::uint8_t REG_INT_PIN_CFG = 55;
     static constexpr std::uint8_t REG_INT_ENABLE = 56;
+    static constexpr std::uint8_t REG_WM_INT_STATUS = 57;
+    static constexpr std::uint8_t REG_INT_STATUS = 58;
+    static constexpr std::uint8_t REG_FIFO_WM_TH1 = 96;
+    static constexpr std::uint8_t REG_FIFO_WM_TH2 = 97;
     static constexpr std::uint8_t REG_SIGNAL_PATH_RESET = 104;
     static constexpr std::uint8_t REG_ACCEL_INTEL_CTRL = 105;
     static constexpr std::uint8_t REG_USER_CTRL = 106;
@@ -73,6 +77,7 @@ private:
     static constexpr std::uint8_t REG_WHO_AM_I = 117;
 
     static constexpr std::uint8_t DEVICE_ID = 0x19;
+    static constexpr std::uint8_t FIFO_THRESHOLD = 20;
 
     static constexpr freertos::Ticks DEFAULT_REG_TIMEOUT = freertos::to_ticks(std::chrono::microseconds(10));
 
@@ -196,10 +201,10 @@ public:
             RESULT_TRY( this->write_single_register(REG_SMPLRT_DIV, 4) );       // SMPLRT_DIV=4 
             // Set DLPF config and FIFO mode
             RESULT_TRY( this->write_single_register(REG_CONFIG, 0x01) );    // FIFO_MODE=0, DLPF_CFG=1
-            // Enable FIFO
+            // Enable gyro and accerometer FIFO
             RESULT_TRY( this->write_single_register(REG_FIFO_EN, 0x18) );   // GYRO_FIFO_EN=1, ACCEL_FIFO_EN=1
-            RESULT_TRY( this->write_single_register(REG_USER_CTRL, 0x40) );   // FIFO_EN=1
-
+            // Configure interrupt
+            RESULT_TRY( this->write_single_register(REG_INT_PIN_CFG, 0xA0));
         }
         
         ESP_LOGI(TAG, "Initialized");
@@ -209,49 +214,79 @@ public:
         return success();
     }
 
+    Result<void, esp_err_t> start()
+    {
+        // Enable FIFO
+        RESULT_TRY( this->write_single_register(REG_USER_CTRL, 0x40) );   // FIFO_EN=1
+        // Set water mark threshold to FIFO_THRESHOLD samples
+        const std::uint16_t threshold = 2*7*FIFO_THRESHOLD;
+        const std::uint8_t threshold_buffer[2] = {threshold >> 8, threshold & 0xff};
+        RESULT_TRY( this->i2c.write_register(this->address, REG_FIFO_WM_TH1, threshold_buffer, 2, DEFAULT_REG_TIMEOUT));
+
+        return success();
+    }
+
+    Result<bool, esp_err_t> check_interrupt_status()
+    {
+        auto result = this->read_single_register(REG_WM_INT_STATUS, DEFAULT_REG_TIMEOUT);
+        if( !result ) {
+            return failure(result);
+        }
+        return success( (result.value & 0x40) != 0 );   // Check if FIFO_WM_INT bit is set.
+    }
+
     Result<void, esp_err_t> update()
     {
-        // Read FIFO status registers to get how many samples in the acc/gyro FIFO.
+        // Read acc/gyro sensor data.
+        std::uint8_t buffer[2*7*FIFO_THRESHOLD];
+
+        // Read FIFO status register to get how many samples in the FIFO.
         std::uint16_t fifo_count = 0;
         {
-            auto count_h = this->read_single_register(REG_FIFO_COUNTH);
-            auto count_l = this->read_single_register(REG_FIFO_COUNTL);
-            if( !count_h ) {
-                return failure(count_h);
-            }
-            if( !count_l ) {
-                return failure(count_l);
-            }
-            fifo_count = (static_cast<std::uint16_t>(count_h.value) << 8 ) | count_l.value;
+            RESULT_TRY( this->i2c.read_register(this->address, REG_FIFO_COUNTH, buffer, 2, DEFAULT_REG_TIMEOUT) );
+            fifo_count = (static_cast<std::uint16_t>(buffer[0]) << 8) | (static_cast<std::uint16_t>(buffer[1]) & 0xff);
         }
-;
-        ESP_LOGD(TAG, "FIFO count: %d", fifo_count);
+        std::uint16_t bytes_remaining = fifo_count - (fifo_count % (2*7));
 
-        this->fifo_counts.queue(fifo_count);
-
-        // Read acc/gyro sensor data.
-        std::uint8_t buffer[2*7] ;
-        for(std::uint16_t remaining = fifo_count; remaining >= sizeof(buffer); remaining -= sizeof(buffer)) {
+        while(bytes_remaining > 0) {
             I2CCommandLink commands;
             if( !commands ) {
                 return failure(ESP_ERR_NO_MEM);
             }
+            std::uint16_t bytes_to_read = bytes_remaining > sizeof(buffer) ? sizeof(buffer) : bytes_remaining;
 
-            RESULT_TRY(commands.read_register(this->address, REG_FIFO_R_W, buffer, sizeof(buffer), i2c_ack_type_t::I2C_MASTER_LAST_NACK));
-            RESULT_TRY(this->i2c.execute(commands, DEFAULT_REG_TIMEOUT));
+            RESULT_TRY(commands.read_register(this->address, REG_FIFO_R_W, buffer, bytes_to_read, i2c_ack_type_t::I2C_MASTER_LAST_NACK));
+            RESULT_TRY(this->i2c.execute(commands, DEFAULT_REG_TIMEOUT*10));
 
-            RawSensorData sensor_data;
-            sensor_data.acc = Vector3I16(
-                    static_cast<int16_t>((static_cast<uint16_t>(buffer[0+0]) << 8) | buffer[0+1]),
-                    static_cast<int16_t>((static_cast<uint16_t>(buffer[0+2]) << 8) | buffer[0+3]),
-                    static_cast<int16_t>((static_cast<uint16_t>(buffer[0+4]) << 8) | buffer[0+5]));
-            sensor_data.gyro = Vector3I16(
-                    static_cast<int16_t>((static_cast<uint16_t>(buffer[8+0]) << 8) | buffer[8+1]),
-                    static_cast<int16_t>((static_cast<uint16_t>(buffer[8+2]) << 8) | buffer[8+3]),
-                    static_cast<int16_t>((static_cast<uint16_t>(buffer[8+4]) << 8) | buffer[8+5]));
-            this->sensor_data_queue.queue(sensor_data);
+            for(std::uint16_t index = 0; index < bytes_to_read; index += 2*7) {   // According to the FIFO_R_W register read value, 0xff indicated that FIFO is empty.
+                RawSensorData sensor_data;
+                sensor_data.acc = Vector3I16(
+                        static_cast<int16_t>((static_cast<uint16_t>(buffer[index+0+0]) << 8) | buffer[index+0+1]),
+                        static_cast<int16_t>((static_cast<uint16_t>(buffer[index+0+2]) << 8) | buffer[index+0+3]),
+                        static_cast<int16_t>((static_cast<uint16_t>(buffer[index+0+4]) << 8) | buffer[index+0+5]));
+                sensor_data.gyro = Vector3I16(
+                        static_cast<int16_t>((static_cast<uint16_t>(buffer[index+8+0]) << 8) | buffer[index+8+1]),
+                        static_cast<int16_t>((static_cast<uint16_t>(buffer[index+8+2]) << 8) | buffer[index+8+3]),
+                        static_cast<int16_t>((static_cast<uint16_t>(buffer[index+8+4]) << 8) | buffer[index+8+5]));
+                this->sensor_data_queue.queue(sensor_data);
+            }
+            bytes_remaining -= bytes_to_read;
+            // for(std::uint16_t i = 0; i < sizeof(buffer); i += 16) {
+            //     char line[16*3+1];
+            //     char* p = line;
+            //     for(std::uint16_t j = 0; j < 16 && i+j < sizeof(buffer); j++, p+=3) {
+            //         sprintf(p, "%02x,", buffer[i+j]);
+            //     }
+            //     *p = 0;
+            //     ESP_LOGI(TAG, "buffer: %04x: %s", i, line);
+            // }
         }
         return success();
+    }
+
+    void clear_sensor_data()
+    {
+        this->sensor_data_queue.reset();
     }
 
     Result<SensorData, bool> get_sensor_data()

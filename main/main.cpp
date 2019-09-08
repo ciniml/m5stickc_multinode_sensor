@@ -50,6 +50,7 @@ private:
     static constexpr std::uint32_t NOTIFY_BIT_TIMER = 0x0001;
     static constexpr std::uint32_t NOTIFY_BIT_CLEAR_ERROR = 0x0002;
     static constexpr std::uint32_t NOTIFY_BIT_START_MEASUREMENT = 0x0004;
+    static constexpr std::uint32_t NOTIFY_BIT_INTERRUPT = 0x0008;
 
     freertos::WaitQueue<IMUData, 128> imu_queue;
     enum class State
@@ -62,57 +63,32 @@ private:
     State state;
     IMU imu;
     BMM150 magnetometer;
+    std::chrono::microseconds timestamp_at_interrupt;
+    std::chrono::microseconds measurement_start_time;
 
     static std::chrono::microseconds get_timestamp() 
     {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
     }
-
-    struct UpdateTimer : Timer<UpdateTimer>
+    void notify_interrupt()
     {
-        IMUTask& task;
-        bool enabled;
-        UpdateTimer(IMUTask& task) : task(task), enabled(true) {}
-        
-        void operator() () 
-        {
-            if( this->task && this->enabled ) {
-                this->task.task().notify(NOTIFY_BIT_TIMER, eNotifyAction::eSetBits);
-            }
+        if( this->task() ) {
+            this->task().notify_from_isr(NOTIFY_BIT_INTERRUPT, eNotifyAction::eSetBits);
         }
+    }
 
-        void enable() { this->enabled = true; }
-        void disable() { this->enabled = false; }
-    };
-    struct MagnetometerTimer : Timer<MagnetometerTimer>
-    {
-        IMUTask& task;
-        freertos::InterlockedValue<Vector3F> value;
-
-        MagnetometerTimer(IMUTask& task) : task(task) {}
-        
-        void operator() () 
-        {
-            auto result = task.magnetometer.read();
-            if( !result ) {
-                ESP_LOGE(TAG, "Failed to read magnetometer");
-                return;
-            }
-
-            this->value.set_value(result.value);
+    static void gpio_isr_handler(void* args) {
+        auto this_ = reinterpret_cast<IMUTask*>(args);
+        if( this_ != nullptr ) {
+            this_->notify_interrupt();
         }
-    };
+    }
 
-    
-    UpdateTimer update_timer;
-    MagnetometerTimer mag_timer;
 public:
     IMUTask(I2CMaster& internal_i2c, I2CMaster& external_i2c) 
         : state(State::NotStarted)
         , imu(i2c_internal, 0x68)
         , magnetometer(external_i2c, 0x10)
-        , update_timer(*this)
-        , mag_timer(*this) 
     {
     }
 
@@ -121,51 +97,34 @@ public:
         this->task().notify(NOTIFY_BIT_CLEAR_ERROR, eNotifyAction::eSetBits);
     }
 
-    void resume() 
-    {
-        this->update_timer.enable();
-    }
-    
-    void pause() 
-    {
-        this->update_timer.disable();
-    }
-
     bool start()
     {
         if( !IMUTask::SelfType::start("IMU", 3, APP_CPU_NUM) ) {
             ESP_LOGE(TAG, "Failed to start IMU task");
             return false;
         }
-
         {
-            auto result = this->update_timer.start(std::chrono::microseconds(10000ul));
-            if( !result ) {
-                ESP_LOGE(TAG, "Failed to start IMU task timer - %x", result.error_code);
-                return false;
-            }
-        }
-        {
-            auto result = this->mag_timer.start(std::chrono::microseconds(100000ul));
-            if( !result ) {
-                ESP_LOGE(TAG, "Failed to start magnetometer timer - %x", result.error_code);
+            auto result = gpio_isr_handler_add(GPIO_NUM_35, &gpio_isr_handler, this);
+            if( result != ESP_OK ) {
+                ESP_LOGE(TAG, "Failed to add ISR handler - %x", result);
                 return false;
             }
         }
         return true;
     }
 
-    void start_measurement()
+    void start_measurement(std::chrono::microseconds measurement_start_time)
     {
-        this->task().notify(NOTIFY_BIT_START_MEASUREMENT, eNotifyAction::eSetBits);
+        if( this->task() ) {
+            this->measurement_start_time = measurement_start_time;
+            this->task().notify(NOTIFY_BIT_START_MEASUREMENT, eNotifyAction::eSetBits);
+        }
     }
 
     void operator() ()
     {
         while(true)
         {
-            freertos::Task::notify_wait(0, NOTIFY_BIT_START_MEASUREMENT, freertos::MAX_DELAY);
-
             if( this->state == State::Error ) {
                 freertos::Task::notify_wait(0, NOTIFY_BIT_CLEAR_ERROR, freertos::MAX_DELAY);
             }
@@ -174,24 +133,13 @@ public:
             this->state = State::Initializing;
             
             for(retry = 0; retry < max_retry; retry++) {
-                {
-                    ESP_LOGI(TAG, "Initializing IMU sensor");
-                    // Initialize IMU
-                    auto result = imu.reset();
-                    if( !result ) {
-                        ESP_LOGE(TAG, "Failed to initialize IMU - %08x", result.error_code);
-                        freertos::Task::delay_ms(10);
-                        continue;
-                    }
-                }
-                {
-                    ESP_LOGI(TAG, "Initializing magnetometer sensor");
-                    auto result = magnetometer.reset();
-                    if( !result ) {
-                        ESP_LOGE(TAG, "Failed to initialize magnetometer - %08x", result.error_code);
-                        freertos::Task::delay_ms(10);
-                        continue;
-                    }
+                ESP_LOGI(TAG, "Initializing IMU sensor");
+                // Initialize IMU
+                auto result = imu.reset();
+                if( !result ) {
+                    ESP_LOGE(TAG, "Failed to initialize IMU - %08x", result.error_code);
+                    freertos::Task::delay_ms(10);
+                    continue;
                 }
                 break;
             }
@@ -199,12 +147,48 @@ public:
                 state = State::Error;
                 continue;
             }
-
+            for(retry = 0; retry < max_retry; retry++) {
+                ESP_LOGI(TAG, "Initializing magnetometer sensor");
+                auto result = magnetometer.reset();
+                if( !result ) {
+                    ESP_LOGE(TAG, "Failed to initialize magnetometer - %08x", result.error_code);
+                    freertos::Task::delay_ms(10);
+                    continue;
+                }
+                break;
+            }
+            if( retry == max_retry ) {
+                state = State::Error;
+                continue;
+            }
+            
+            // Clear IMU FIFOs.
+            imu.update();
+            imu.clear_sensor_data();
             ESP_LOGI(TAG, "IMU initialization completed.");
+
+            freertos::Task::notify_wait(0, NOTIFY_BIT_START_MEASUREMENT, freertos::MAX_DELAY);
+
+            while( this->measurement_start_time - get_timestamp() >= std::chrono::seconds(2) ) {
+                freertos::Task::delay_ms(1);
+            }
+            while( this->measurement_start_time < this->get_timestamp() ); // Spin wait
+            
+            // Start IMU
+            imu.start();
             this->state = State::Active;
 
-            while( freertos::Task::notify_wait(0, NOTIFY_BIT_TIMER, freertos::MAX_DELAY).is_success ) {
-                ESP_LOGV(TAG, "IMU sensor measurement begin");
+            while( auto notify_result = freertos::Task::notify_wait(0, NOTIFY_BIT_TIMER | NOTIFY_BIT_INTERRUPT, freertos::MAX_DELAY) ) {
+                Timestamp timestamp = this->get_timestamp();
+                //ESP_LOGI(TAG, "IMU sensor measurement begin notification=%x timestamp=%lld delay=%lld", notify_result.value, this->timestamp_at_interrupt.count(), wake_up_delay.count());
+                if( !(notify_result.value & NOTIFY_BIT_TIMER) && (notify_result.value & NOTIFY_BIT_INTERRUPT) ) {
+                    // Interrupt notification. We have to check the interrupt status.
+                    auto result = imu.check_interrupt_status();
+                    if( !result || !result.value ) {
+                        continue;
+                    }
+                }
+                auto mag = this->magnetometer.read().unwrap_or(Vector3F(0, 0, 0));
 
                 // Read IMU sensor data via I2C
                 auto result = imu.update();
@@ -216,8 +200,8 @@ public:
                     {
                         imu_data.acc = result.value.acc;
                         imu_data.gyro = result.value.gyro;
-                        imu_data.mag = this->mag_timer.value.get_value();
-                        imu_data.timestamp = get_timestamp();
+                        imu_data.mag = mag;
+                        imu_data.timestamp = timestamp;
                         ESP_LOGV(TAG, "IMU sensor measurement end. acc=%f,%f,%f gyro=%f,%f,%f mag=%f,%f,%f"
                             , imu_data.acc.x_const()
                             , imu_data.acc.y_const()
@@ -338,6 +322,17 @@ static void do_initializing()
     lcd.print("Initializing...");
 
     esp_err_t result = ESP_OK;
+    // Initialize GPIO
+    {
+        gpio_config_t config;
+        config.pin_bit_mask = 1ull << 35;
+        config.mode = gpio_mode_t::GPIO_MODE_INPUT;
+        config.pull_up_en = gpio_pullup_t::GPIO_PULLUP_DISABLE;
+        config.pull_down_en = gpio_pulldown_t::GPIO_PULLDOWN_DISABLE;
+        config.intr_type = gpio_int_type_t::GPIO_INTR_NEGEDGE;
+        if( check_fatal(gpio_config(&config), "failed to initialize GPIO35" ) ) return;
+    }
+    if( check_fatal(gpio_install_isr_service(0), "failed to initialize interrupt") ) return;
 
     // Initialize NVS
     result = nvs_flash_init();
@@ -355,7 +350,7 @@ static void do_initializing()
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     if( check_fatal(esp_wifi_init(&wifi_cfg), "failed to initialize Wi-Fi (init)") ) return;
     if( check_fatal(esp_wifi_set_storage(WIFI_STORAGE_RAM), "failed to initialize Wi-Fi (storage)") ) return;
-    
+
     main_state = MainState::ModeSelecting;
     buttons.clear_events();
 }
@@ -395,6 +390,15 @@ static void do_modeselecting()
 static SensorNode sensor_node;
 static freertos::WaitEvent sensor_node_received_event;
 static freertos::WaitEvent measurement_request_received_event;
+// ESP-NOW handler
+static void esp_now_recv_handler(const uint8_t *mac_addr, const uint8_t *data, int data_len)
+{
+    sensor_node.process_esp_now_packet(mac_addr, data, data_len);
+}
+static void esp_now_send_handler(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+}
+
 static void do_sensor_connecting()
 {
     static std::uint8_t mode = 0;
@@ -419,7 +423,13 @@ static void do_sensor_connecting()
     
     std::uint8_t mac_address[6];
     if( check_fatal( esp_wifi_get_mac(WIFI_IF_STA, mac_address), "Failed to get MAC address") ) return;
+        
+    // Initialize ESP-NOW
+    if( check_fatal(esp_now_init(), "failed to initialize ESP-NOW") ) return;
+    if( check_fatal(esp_now_register_recv_cb(esp_now_recv_handler), "failed to initialize ESP-NOW") ) return;
+    if( check_fatal(esp_now_register_send_cb(esp_now_send_handler), "failed to initialize ESP-NOW") ) return;
 
+    // connect to wifi AP
     wifi_sta_connected.reset();
     if( check_fatal(esp_wifi_connect(), "failed to connect to WI-Fi AP") ) return;
     lcd.println("Waiting AP connection...");
@@ -431,20 +441,8 @@ static void do_sensor_connecting()
     
     lcd.println("Waiting measurement request...");
     measurement_request_received_event.wait();
-
-    lcd.println("Waiting until target time...");
-    while( sensor_node.get_measurement_target_time() - sensor_node.get_adjusted_timestamp() >= std::chrono::seconds(2) ) {
-        auto timestamp = sensor_node.get_adjusted_timestamp();
-        lcd.fillScreen(0);
-        lcd.setCursor(0, 0);
-        lcd.setTextColor(lcd.color565(255, 255, 255));
-        lcd.printf("%llu, %llu, %lld", sensor_node.get_measurement_target_time().count(), timestamp.count(), (sensor_node.get_measurement_target_time() - timestamp).count());
-        freertos::Task::delay_ms(1000);
-    }
-    while( sensor_node.measurement_target_time < sensor_node.get_adjusted_timestamp() ); // Spin wait
-
-    imu_task.start_measurement();
-
+    
+    imu_task.start_measurement(sensor_node.get_measurement_target_time() - sensor_node.time_offset);
     main_state = MainState::SensorConnected;
 }
 
@@ -457,7 +455,7 @@ static void do_sensor_connected()
 
     while( auto result = imu_task.receive() ) {
         const auto& data = result.value;
-        sensor_node.send_sensor_data(data.timestamp + sensor_node.time_offset, data.acc, data.gyro, data.mag);
+        sensor_node.send_sensor_data(data.timestamp, data.acc, data.gyro, data.mag);
         auto now = sensor_node.get_timestamp();
         if( now - last_frame_updated >= std::chrono::milliseconds(500) ) {
             last_frame_updated = now;

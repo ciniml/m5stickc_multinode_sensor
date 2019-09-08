@@ -68,6 +68,32 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     SensorCommunication communication;
     SensorNodePacket sensor_data_packet;
 
+    enum class NodeSyncState
+    {
+        Idle,
+        // Node sync master state
+        SendingSyncRequest,
+        WaitingSyncResponse,
+        SendingNotifyDelay,
+        WaitingDelayResponse,
+        DelayResponseReceived,
+        // Node sync slave state
+        SendingSyncResponse,
+        WaitingNotifyDelay,
+        SendingDelayResponse,
+    };
+    struct NodeSyncContext {
+        NodeSyncState state;
+        std::uint8_t mac_address[6];
+        std::chrono::microseconds last_send_time;
+        std::chrono::microseconds sync_request_timestamp;
+        std::chrono::microseconds sync_request_received_timestamp;
+        std::chrono::microseconds sync_response_timestamp;
+        std::chrono::microseconds notify_delay_timestamp;
+        NodeSyncContext() : state(NodeSyncState::Idle) {}
+    };
+    NodeSyncContext node_sync_context;
+
     static std::chrono::microseconds get_timestamp() 
     {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
@@ -95,6 +121,172 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         return this->measurement_target_time;
     }
 
+    Result<void, esp_err_t> ensure_esp_now_peer_exist(const std::uint8_t* mac_address)
+    {
+        if( !esp_now_is_peer_exist(mac_address) ) {
+            esp_now_peer_info_t peer;
+            memset(&peer, 0, sizeof(peer));
+            peer.channel = 1;
+            peer.ifidx = ESP_IF_WIFI_STA;
+            memcpy(peer.peer_addr, mac_address, 6);
+            auto result = esp_now_add_peer(&peer);
+            if( result != ESP_OK ) {
+                return failure(result);
+            }
+        }
+        return success();
+    }
+    void process_esp_now_packet(const std::uint8_t* mac_addr, const std::uint8_t* data , int data_len)
+    {
+        auto timestamp = get_timestamp();
+        auto adjusted_timestamp = this->get_adjusted_timestamp();
+        ESP_LOGI(TAG, "ESP-NOW received from " MACSTR, MAC2STR(mac_addr));
+
+        if( data_len >= SensorNodePacket::HEADER_SIZE ) {
+            auto packet = reinterpret_cast<const SensorNodePacket*>(data);
+            auto validate_result = packet->validate();
+            if( !validate_result ) {
+                ESP_LOGI(TAG, "ESP-NOW invalid packet %d", static_cast<std::uint8_t>(validate_result.error_code));
+                return;
+            }
+            ESP_LOGI(TAG, "ESP-NOW received %d from " MACSTR, static_cast<std::uint8_t>(packet->type), MAC2STR(mac_addr));
+
+            this->ensure_esp_now_peer_exist(mac_address);
+            
+            switch(packet->type) {
+                case SensorNodePacketType::SyncRequest: {
+                    if( this->node_sync_context.state == NodeSyncState::Idle ) {
+                        this->node_sync_context.sync_request_timestamp  = std::chrono::microseconds(packet->timestamp);
+                        this->node_sync_context.sync_request_received_timestamp = timestamp;
+                        memcpy(this->node_sync_context.mac_address, mac_addr, 6);
+                        this->node_sync_context.state = NodeSyncState::SendingSyncResponse;
+                    }
+                    break;
+                }
+                case SensorNodePacketType::NotifyDelay: {
+                    if( this->node_sync_context.state == NodeSyncState::WaitingNotifyDelay ) {
+                        this->node_sync_context.notify_delay_timestamp = std::chrono::microseconds(packet->timestamp);
+                        this->node_sync_context.state = NodeSyncState::SendingDelayResponse;
+                    }
+                    break;
+                }
+                case SensorNodePacketType::SyncResponse: {
+                    if( this->node_sync_context.state == NodeSyncState::WaitingSyncResponse ) {
+                        this->node_sync_context.sync_response_timestamp = adjusted_timestamp;
+                        this->node_sync_context.state = NodeSyncState::SendingNotifyDelay;
+                    }
+                    break;
+                }
+                case SensorNodePacketType::DelayResponse: {
+                    if( this->node_sync_context.state == NodeSyncState::WaitingDelayResponse ) {
+                        if( memcmp(mac_addr, this->node_sync_context.mac_address, 6) == 0 ) {
+                            this->node_sync_context.state = NodeSyncState::DelayResponseReceived;
+                        }
+                    }
+                    break;
+                }
+                
+                default:
+                    break;
+            }
+        }
+    }
+
+    void process_node_sync()
+    {
+        this->ensure_esp_now_peer_exist(this->node_sync_context.mac_address);
+
+        switch(this->node_sync_context.state) {
+            case NodeSyncState::SendingSyncRequest: {
+                SensorNodePacket packet;
+                packet.type = SensorNodePacketType::SyncRequest;
+                packet.set_timestamp(this->get_adjusted_timestamp());
+                packet.set_size_and_crc();
+                auto result = esp_now_send(this->node_sync_context.mac_address, reinterpret_cast<const std::uint8_t*>(&packet), packet.total_size());
+                if( result == ESP_OK ) {
+                    ESP_LOGI(TAG, "Send SyncRequest to " MACSTR, MAC2STR(this->node_sync_context.mac_address));
+                    this->last_send_time = get_timestamp();
+                    this->node_sync_context.state = NodeSyncState::WaitingSyncResponse;
+                }
+                break;
+            }
+            case NodeSyncState::WaitingSyncResponse: {
+                if( get_timestamp() - this->last_send_time >= std::chrono::seconds(2) ) {
+                    this->node_sync_context.state = NodeSyncState::SendingSyncRequest;
+                }
+                break;
+            }
+            case NodeSyncState::SendingSyncResponse: {
+                this->node_sync_context.sync_response_timestamp = get_timestamp();
+                SensorNodePacket packet;
+                packet.type = SensorNodePacketType::SyncResponse;
+                packet.set_timestamp(this->node_sync_context.sync_response_timestamp);
+                packet.set_size_and_crc();
+                auto result = esp_now_send(this->node_sync_context.mac_address, reinterpret_cast<const std::uint8_t*>(&packet), packet.total_size());
+                if( result == ESP_OK ) {
+                    ESP_LOGI(TAG, "Send SyncResponse to " MACSTR, MAC2STR(this->node_sync_context.mac_address));
+                    this->last_send_time = get_timestamp();
+                    this->node_sync_context.state = NodeSyncState::WaitingNotifyDelay;
+                }
+                break;
+            }
+            case NodeSyncState::WaitingNotifyDelay: {
+                if( get_timestamp() - this->last_send_time >= std::chrono::seconds(2) ) {
+                    this->node_sync_context.state = NodeSyncState::SendingSyncResponse;
+                }
+                break;
+            }
+            case NodeSyncState::SendingNotifyDelay: {
+                SensorNodePacket packet;
+                packet.type = SensorNodePacketType::NotifyDelay;
+                packet.set_timestamp(this->node_sync_context.sync_response_timestamp);
+                packet.set_size_and_crc();
+                auto result = esp_now_send(this->node_sync_context.mac_address, reinterpret_cast<const std::uint8_t*>(&packet), packet.total_size());
+                if( result == ESP_OK ) {
+                    ESP_LOGI(TAG, "Send NotifyDelay to " MACSTR, MAC2STR(this->node_sync_context.mac_address));
+                    this->last_send_time = get_timestamp();
+                    this->node_sync_context.state = NodeSyncState::WaitingDelayResponse;
+                }
+                break;
+            }
+            case NodeSyncState::WaitingDelayResponse: {
+                if( get_timestamp() - this->last_send_time >= std::chrono::seconds(2) ) {
+                    this->node_sync_context.state = NodeSyncState::SendingNotifyDelay;
+                }
+                break;
+            }
+            case NodeSyncState::SendingDelayResponse: {
+                SensorNodePacket packet;
+                packet.type = SensorNodePacketType::DelayResponse;
+                packet.set_timestamp(get_timestamp());
+                packet.set_size_and_crc();
+                auto result = esp_now_send(this->node_sync_context.mac_address, reinterpret_cast<const std::uint8_t*>(&packet), packet.total_size());
+                if( result == ESP_OK ) {
+                    // Calculate offset 
+                    this->time_offset = -((this->node_sync_context.sync_request_received_timestamp - this->node_sync_context.sync_request_timestamp) - (this->node_sync_context.notify_delay_timestamp - this->node_sync_context.sync_response_timestamp)) / 2;
+                    ESP_LOGI(TAG, "Send DelayResponse to " MACSTR, MAC2STR(this->node_sync_context.mac_address));
+                    ESP_LOGI(TAG, "Node sync offset=%lld", this->time_offset.count());
+                    this->last_send_time = get_timestamp();
+                    this->node_sync_context.state = NodeSyncState::Idle;
+                } 
+                break;
+            }
+            case NodeSyncState::DelayResponseReceived: {
+                SensorNodePacket packet;
+                packet.type = SensorNodePacketType::SyncResponse;
+                packet.set_timestamp(get_timestamp());
+                packet.set_size_and_crc();
+                auto result = this->send_packet(packet);
+                if( result ) {
+                    this->node_sync_context.state = NodeSyncState::Idle;
+                }
+                break;
+            }
+            
+            default:
+                break;
+        }
+    }
     Result<void, esp_err_t> start(const SensorNodeAddress& address, std::uint16_t port, const std::uint8_t* mac_address, const char* name, freertos::WaitEvent* measurement_requested_event)
     {
         ESP_LOGI(TAG, "Starting Sensor node receiver addr:" IPSTR " port:%d", IP2STR(address.ip_address), port);
@@ -102,6 +294,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         strcpy(reinterpret_cast<char*>(this->name), name);
         this->address = address;
         this->port = port;
+
         {
             auto result = this->communication.start(this->address, this->port);
             if( !result ) {
@@ -234,6 +427,17 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
             this->state = State::Connected;
         }
     }
+
+    void sync_request_received(const PBufPacket& raw_packet, const SensorNodePacket& packet_received)
+    {
+        ESP_LOGI(TAG, "Sync request from " IPSTR " received", IP2STR(raw_packet.address.ip_address));
+        
+        if( this->node_sync_context.state == NodeSyncState::Idle ) {
+            memcpy(this->node_sync_context.mac_address, packet_received.body.sync_request.target_mac, 6);
+            this->node_sync_context.state = NodeSyncState::SendingSyncRequest;
+        }
+    }
+
     void measurement_request_received(const PBufPacket& raw_packet, const SensorNodePacket& packet_received)
     {
         ESP_LOGI(TAG, "Measurement request from " IPSTR " received", IP2STR(raw_packet.address.ip_address));
@@ -260,7 +464,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         SensorNodePacket& packet = this->sensor_data_packet;
 
         if( packet.body.sensor_data.number_of_samples == 0 ) {
-            packet.body.sensor_data.set_timestamp(timestamp);
+            packet.body.sensor_data.set_timestamp(timestamp + this->time_offset);
         }
         memcpy(packet.body.sensor_data.samples[packet.body.sensor_data.number_of_samples].acc , acc .items.data(), sizeof(float)*3);
         memcpy(packet.body.sensor_data.samples[packet.body.sensor_data.number_of_samples].gyro, gyro.items.data(), sizeof(float)*3);
@@ -306,6 +510,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
                     case SensorNodePacketType::NotifyDelay:
                         this->notify_delay_received(result.value, packet);
                         break;
+                    case SensorNodePacketType::SyncRequest:
+                        this->sync_request_received(result.value, packet);
+                        break;
                     case SensorNodePacketType::MeasurementRequest:
                         this->measurement_request_received(result.value, packet);
                         break;
@@ -320,6 +527,9 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
             if( this->state == State::Syncing ) {
                 this->send_delay_response();
             }
+
+            // Process node sync
+            this->process_node_sync();
         }
         this->running_lock.release();
     }
