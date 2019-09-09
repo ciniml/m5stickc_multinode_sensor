@@ -161,7 +161,18 @@ public:
                 state = State::Error;
                 continue;
             }
-            
+            // Setup debug GPIO out
+            {
+                gpio_config_t config;
+                config.mode = gpio_mode_t::GPIO_MODE_OUTPUT;
+                config.pin_bit_mask = 1ull << 33;
+                config.pull_up_en = gpio_pullup_t::GPIO_PULLUP_DISABLE;
+                config.pull_down_en = gpio_pulldown_t::GPIO_PULLDOWN_DISABLE;
+                config.intr_type = gpio_int_type_t::GPIO_INTR_DISABLE;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&config));
+                gpio_set_level(GPIO_NUM_33, 0);
+            }
+
             // Clear IMU FIFOs.
             imu.update();
             imu.clear_sensor_data();
@@ -180,6 +191,7 @@ public:
 
             while( auto notify_result = freertos::Task::notify_wait(0, NOTIFY_BIT_TIMER | NOTIFY_BIT_INTERRUPT, freertos::MAX_DELAY) ) {
                 Timestamp timestamp = this->get_timestamp();
+                gpio_set_level(GPIO_NUM_33, 1);
                 //ESP_LOGI(TAG, "IMU sensor measurement begin notification=%x timestamp=%lld delay=%lld", notify_result.value, this->timestamp_at_interrupt.count(), wake_up_delay.count());
                 if( !(notify_result.value & NOTIFY_BIT_TIMER) && (notify_result.value & NOTIFY_BIT_INTERRUPT) ) {
                     // Interrupt notification. We have to check the interrupt status.
@@ -192,6 +204,7 @@ public:
 
                 // Read IMU sensor data via I2C
                 auto result = imu.update();
+                gpio_set_level(GPIO_NUM_33, 0);
                 if( result ) {
                     IMUData imu_data;
                     //imu_data.max_fifo_usage  = imu.get_max_fifo_usage();
