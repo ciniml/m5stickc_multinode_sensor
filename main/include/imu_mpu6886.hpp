@@ -190,7 +190,7 @@ public:
         ESP_LOGI(TAG, "Configuring Device...");
         {
             // Configure power management
-            RESULT_TRY( this->write_single_register(REG_PWR_MGMT_1, 0x00) );
+            RESULT_TRY( this->write_single_register(REG_PWR_MGMT_1, 0x01) );    // CKSEL[2:0] = 0b001
             
             // Set full scale 
             RESULT_TRY( this->set_accelerometer_fullscale(AccelerometerFullScale::G_16) );
