@@ -89,7 +89,7 @@ struct __attribute__((packed)) SensorNodePacket
 {
     static constexpr std::uint16_t MAGIC = 0xBEEF;
     static constexpr std::size_t HEADER_SIZE = 16;
-    static constexpr std::size_t MAX_SENSOR_DATA_SAMPLES = 16;
+    static constexpr std::size_t MAX_SENSOR_DATA_SAMPLES = 20;
     std::uint16_t magic;
     SensorNodePacketType type;
     std::uint8_t reserved;
