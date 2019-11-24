@@ -14,6 +14,7 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
+#include <esp_pm.h>
 #include <nvs_flash.h>
 #include <driver/i2c.h>
 #include <rom/crc.h>
@@ -34,7 +35,9 @@
 #include <sensor_node.hpp>
 #include <receiver_node.hpp>
 
-static constexpr std::uint16_t SENSOR_NODE_PORT = 10010;
+static constexpr std::uint16_t SENSOR_NODE_PORT = 10020;
+static constexpr const char* SENSOR_NODE_AP_SSID = "ds9";
+static constexpr const char* SENSOR_NODE_AP_PASSWORD = "hogeFugapiyo";
 
 static M5Display lcd;
 
@@ -65,7 +68,11 @@ private:
     BMM150 magnetometer;
     std::chrono::microseconds timestamp_at_interrupt;
     std::chrono::microseconds measurement_start_time;
-
+    PMU::ADCRegisters pmu_adc_registers;
+    float battery_voltage;
+    float battery_charge_current;
+    float battery_discharge_current;
+    
     static std::chrono::microseconds get_timestamp() 
     {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
@@ -89,6 +96,9 @@ public:
         : state(State::NotStarted)
         , imu(i2c_internal, 0x68)
         , magnetometer(external_i2c, 0x10)
+        , battery_voltage(0)
+        , battery_charge_current(0)
+        , battery_discharge_current(0)
     {
     }
 
@@ -232,6 +242,13 @@ public:
                 else {
                     ESP_LOGE(TAG, "IMU update failed - %x", result.error_code);
                 }
+
+                // Update PMU data
+                if( pmu.read_adc_registers(this->pmu_adc_registers) ) {
+                    this->battery_voltage = ((this->pmu_adc_registers.battery_voltage_h8 << 4) | this->pmu_adc_registers.battery_voltage_l4) * 1.1e-3f;
+                    this->battery_charge_current = ((this->pmu_adc_registers.battery_charge_current_h8 << 5) | this->pmu_adc_registers.battery_charge_current_l5) * 0.5e-3f;
+                    this->battery_discharge_current = ((this->pmu_adc_registers.battery_discharge_current_h8 << 5) | this->pmu_adc_registers.battery_discharge_current_l5) * 0.5e-3f;
+                }
             }
         }
     }
@@ -244,6 +261,10 @@ public:
         }
         return success<IMUData>(imu_data);
     }
+
+    float get_battery_voltage() const { return this->battery_voltage; }
+    float get_battery_charge_current() const { return this->battery_charge_current; }
+    float get_battery_discharge_current() const { return this->battery_discharge_current; }
 };
 
 // Main Task
@@ -363,7 +384,16 @@ static void do_initializing()
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     if( check_fatal(esp_wifi_init(&wifi_cfg), "failed to initialize Wi-Fi (init)") ) return;
     if( check_fatal(esp_wifi_set_storage(WIFI_STORAGE_RAM), "failed to initialize Wi-Fi (storage)") ) return;
+    if( check_fatal(esp_wifi_set_ps(wifi_ps_type_t::WIFI_PS_MAX_MODEM), "failed to initialize Wi-Fi (PS)")) return;
 
+    // Initialize power management
+    esp_pm_config_esp32_t pm_config;
+    memset(&pm_config, 0, sizeof(pm_config));
+    pm_config.max_freq_mhz = 80;
+    pm_config.min_freq_mhz = 80;
+    pm_config.light_sleep_enable = true;
+    if( check_fatal(esp_pm_configure(&pm_config), "failed to configure power management")) return;
+    
     main_state = MainState::ModeSelecting;
     buttons.clear_events();
 }
@@ -468,7 +498,12 @@ static void do_sensor_connected()
 
     while( auto result = imu_task.receive() ) {
         const auto& data = result.value;
-        sensor_node.send_sensor_data(data.timestamp, data.acc, data.gyro, data.mag);
+        BatterySensorData battery;
+        battery.voltage = imu_task.get_battery_voltage();
+        battery.charge_current = imu_task.get_battery_charge_current();
+        battery.discharge_current = imu_task.get_battery_discharge_current();
+
+        sensor_node.send_sensor_data(data.timestamp, data.acc, data.gyro, data.mag, battery);
         auto now = sensor_node.get_timestamp();
         if( now - last_frame_updated >= std::chrono::milliseconds(500) ) {
             last_frame_updated = now;
@@ -476,6 +511,8 @@ static void do_sensor_connected()
             lcd.setCursor(0, 0);
             lcd.printf("max time: %0.2f [ms]\n", sensor_node.max_send_complete_elapsed.count()/1000.0f);
             lcd.printf("avg time: %0.2f [ms]\n", sensor_node.average_send_complete_elapsed.count()/1000.0f);
+            auto current = battery.charge_current - battery.discharge_current;
+            lcd.printf("battery: %0.2fV %0.2fmA\n", battery.voltage, current*1000.0f);
         }
     }
 }

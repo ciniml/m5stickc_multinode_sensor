@@ -115,8 +115,12 @@ struct __attribute__((packed)) SensorNodePacket
         struct __attribute__((packed))
         {
             std::uint8_t number_of_samples;
-            std::uint8_t reserved[7];
+            std::uint8_t reserved[3];
+            std::uint32_t packet_index;
             std::uint64_t timestamp;
+            float battery_voltage;
+            float battery_charge_current;
+            float battery_discharge_current;
             struct 
             {
                 float acc[3];

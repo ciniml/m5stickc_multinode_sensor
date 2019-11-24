@@ -32,6 +32,13 @@
 #include <clock_source.hpp>
 #include <sensor_communication.hpp>
 
+struct BatterySensorData
+{
+    float voltage;
+    float charge_current;
+    float discharge_current;
+};
+
 struct SensorNode : public freertos::StaticTask<8192, SensorNode>
 {
     static constexpr const char* TAG = "SENSOR";
@@ -56,6 +63,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     std::uint16_t port;
     std::uint8_t mac_address[6];
     char name[32];
+    std::uint32_t sensor_data_packet_index;
 
     std::chrono::microseconds connection_request_timestamp;
     std::chrono::microseconds connection_request_received_time;
@@ -100,7 +108,8 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     }
     
     SensorNode() : running(false)
-                 , state(State::Idle) 
+                 , state(State::Idle)
+                 , sensor_data_packet_index(0)
                  , connection_request_timestamp(0)
                  , connection_request_received_time(0)
                  , connection_response_send_time(0)
@@ -459,7 +468,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
         }
     }
 
-    void send_sensor_data(std::chrono::microseconds timestamp, const Vector3F& acc, const Vector3F& gyro, const Vector3F& mag)
+    void send_sensor_data(std::chrono::microseconds timestamp, const Vector3F& acc, const Vector3F& gyro, const Vector3F& mag, const BatterySensorData& battery)
     {
         SensorNodePacket& packet = this->sensor_data_packet;
 
@@ -474,10 +483,14 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
 
         if( packet.body.sensor_data.number_of_samples == SensorNodePacket::MAX_SENSOR_DATA_SAMPLES ) {
             packet.magic = SensorNodePacket::MAGIC;
-
+            packet.body.sensor_data.battery_voltage = battery.voltage;
+            packet.body.sensor_data.battery_charge_current    = battery.charge_current;
+            packet.body.sensor_data.battery_discharge_current = battery.discharge_current;
+            packet.body.sensor_data.packet_index = this->sensor_data_packet_index++;
             packet.type = SensorNodePacketType::SensorData;
             packet.set_timestamp(this->get_adjusted_timestamp());
             packet.reserved = 0;
+            
             packet.set_size_and_crc();
             auto result = this->send_packet(packet);
             if( !result ) {

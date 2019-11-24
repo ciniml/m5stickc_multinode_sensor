@@ -197,7 +197,7 @@ public:
             RESULT_TRY(this->write_single_register(AXP192_REG_CHARGING_CONFIG, 0xc1));          // Enable charging, 190mA, 4.2V, 90%
             RESULT_TRY(this->enable_coulomb_counter());                                         // Enable coulomb counter (battery energy counter)
             RESULT_TRY(this->enable_power_outputs());                                           // Enable EXTEN, LDO3, LDO2, DC-DC1 output
-            RESULT_TRY(this->write_single_register(AXP192_REG_PEK_CONFIG, 0x4d));               // Shutdown 4s, Shutdown with button press longer than 4s, 
+            RESULT_TRY(this->write_single_register(AXP192_REG_PEK_CONFIG, 0x4c));               // Shutdown 4s, Shutdown with button press longer than 4s, 
             RESULT_TRY(this->write_single_register(AXP192_REG_GPIO0_FUNCTION, 0x02));           // GPIO0 = Low Noise LDO, 
             RESULT_TRY(this->write_single_register(AXP192_REG_VBUS_IPSOUT_PATH_CONFIG, 0xe0));  // No use N_VBUSen, Limit Vbus voltage = 4.4V, Limit Vbus current = 500mA
             RESULT_TRY(this->write_single_register(AXP192_REG_VHTF_CHARGE_THRESHOLD, 0xfc));    // 
