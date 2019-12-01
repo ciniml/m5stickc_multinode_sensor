@@ -15,9 +15,12 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_pm.h>
+#include <esp_http_server.h>
 #include <nvs_flash.h>
 #include <driver/i2c.h>
 #include <rom/crc.h>
+
+#include <cJSON.h>
 
 #include <M5Display.h>
 
@@ -35,9 +38,28 @@
 #include <sensor_node.hpp>
 #include <receiver_node.hpp>
 
-static constexpr std::uint16_t SENSOR_NODE_PORT = 10020;
-static constexpr const char* SENSOR_NODE_AP_SSID = "ds9";
-static constexpr const char* SENSOR_NODE_AP_PASSWORD = "hogeFugapiyo";
+struct __attribute__((packed)) SensorNodeConfig
+{
+    std::uint8_t version;
+    std::uint16_t port;
+    std::uint8_t ssid_len;
+    char ssid[32];
+    char password[64];
+    char name[32];
+    wifi_auth_mode_t auth_mode;
+};
+
+static constexpr const SensorNodeConfig DefaultConfig = {
+    .version = 1,
+    .port = 10020,
+    .ssid_len = 0,
+    .ssid = {0},
+    .password = {0},
+    .name = {0},
+    .auth_mode = wifi_auth_mode_t::WIFI_AUTH_OPEN,
+};
+
+static SensorNodeConfig sensor_node_config = DefaultConfig;
 
 static M5Display lcd;
 
@@ -272,6 +294,7 @@ static constexpr const char* TAG = "MAIN";
 
 static IMUTask imu_task(i2c_internal, i2c_external);
 static Button buttons;
+static freertos::WaitEvent wifi_sta_ap_started;
 static freertos::WaitQueue<tcpip_adapter_ip_info_t, 1> wifi_sta_connected;
 
 enum class MainState
@@ -283,6 +306,7 @@ enum class MainState
     ReceiverConnecting,
     ReceiverConnected,
     Testing,
+    SetAccessPoint,
     FatalError,
 };
 
@@ -335,6 +359,7 @@ static esp_err_t system_event_handler(void *ctx, system_event_t *event)
     case SYSTEM_EVENT_AP_START:
     case SYSTEM_EVENT_STA_START:
         ESP_LOGI(TAG, "WiFi started");
+        wifi_sta_ap_started.set();
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
         ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
@@ -376,6 +401,20 @@ static void do_initializing()
     }
     if( check_fatal(result, "failed to initialize NVS") ) return;
     
+    // Load configuration.
+    nvs_handle handle;
+    if( nvs_open("sensor_node", NVS_READONLY, &handle) == ESP_OK) {
+        SensorNodeConfig config;
+        size_t size = sizeof(config);
+        if( nvs_get_blob(handle, "config", &config, &size) == ESP_OK ) {
+            if( config.version == 1 ) {
+                sensor_node_config = config;
+                ESP_LOGI(TAG, "Valid configuration was found and loaded.");
+            }
+        }
+        nvs_close(handle);
+    }
+
     // Initialize event handler
     if( check_fatal(esp_event_loop_init(system_event_handler, nullptr), "failed to initialize event handler") ) return;
 
@@ -398,32 +437,46 @@ static void do_initializing()
     buttons.clear_events();
 }
 
+enum class OperatingMode 
+{
+    Sensor,
+    //Receiver,
+    SetAP,
+    Last,
+};
+
 static void do_modeselecting()
 {
-    static std::uint8_t mode = 0;
+    static OperatingMode mode = OperatingMode::Sensor;
 
     lcd.fillScreen(0);
     lcd.setCursor(0, 0);
     lcd.setTextColor(lcd.color565(255, 255, 255));
     lcd.print("Select Mode: ");
-    if( mode == 0 ) {
-        lcd.println("Sensor");
+    switch(mode)
+    {
+        case OperatingMode::Sensor: lcd.println("Sensor"); break;
+        //case OperatingMode::Receiver: lcd.println("Receiver"); break;
+        case OperatingMode::SetAP: lcd.println("SetAP"); break;
+        case OperatingMode::Last: /* dummy */ break;
     }
-    else {
-        lcd.println("Receiver");
-    }
+    
 
     while( auto event = buttons.read_event(freertos::to_ticks(std::chrono::milliseconds(10))) ) {
         if( event.value.type == Button::EventType::Pushed ) {
             if( event.value.position == Button::Position::B ) {
-                mode = mode ^ 1;
+                mode = static_cast<OperatingMode>(static_cast<int>(mode) + 1);
+                if( mode == OperatingMode::Last ) {
+                    mode = OperatingMode::Sensor;
+                }
             }
             else {
-                if( mode == 0 ) {
-                    main_state = MainState::SensorConnecting;
-                }
-                else {
-                    main_state = MainState::ReceiverConnecting;
+                switch(mode)
+                {
+                    case OperatingMode::Sensor: main_state = MainState::SensorConnecting; break;
+                    //case OperatingMode::Receiver: main_state = MainState::ReceiverConnecting; break;
+                    case OperatingMode::SetAP: main_state = MainState::SetAccessPoint; break;
+                    case OperatingMode::Last: /* dummy */ break;
                 }
             }
         }
@@ -459,8 +512,11 @@ static void do_sensor_connecting()
     if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
-    strcpy(reinterpret_cast<char*>(wifi_config.sta.ssid), SENSOR_NODE_AP_SSID);
-    strcpy(reinterpret_cast<char*>(wifi_config.sta.password), SENSOR_NODE_AP_PASSWORD);
+    memcpy(wifi_config.sta.ssid, sensor_node_config.ssid, sensor_node_config.ssid_len);
+    if( sensor_node_config.ssid_len < sizeof(wifi_config.sta.ssid) ) {
+        wifi_config.sta.ssid[sensor_node_config.ssid_len] = 0;
+    }
+    strcpy(reinterpret_cast<char*>(wifi_config.sta.password), sensor_node_config.password);
     if( check_fatal(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), "failed to set Wi-Fi config") ) return;
     if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
     
@@ -480,7 +536,7 @@ static void do_sensor_connecting()
     wifi_sta_connected.receive(ip_info);
     
     lcd.println("Starting sensor node...");
-    check_fatal(sensor_node.start(SensorNodeAddress(ip_info.gw), SENSOR_NODE_PORT, mac_address, "sensor_node", &measurement_request_received_event), "failed to start sensor node");
+    check_fatal(sensor_node.start(SensorNodeAddress(ip_info.gw), sensor_node_config.port, mac_address, "sensor_node", &measurement_request_received_event), "failed to start sensor node");
     
     lcd.println("Waiting measurement request...");
     measurement_request_received_event.wait();
@@ -558,9 +614,9 @@ static void do_receiver_connecting()
     if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR), "failed to initialize Wi-Fi (protocol)") ) return;
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
-    strcpy(reinterpret_cast<char*>(wifi_config.ap.ssid), SENSOR_NODE_AP_SSID);
-    strcpy(reinterpret_cast<char*>(wifi_config.ap.password), SENSOR_NODE_AP_PASSWORD);
-    wifi_config.ap.ssid_len = strlen(SENSOR_NODE_AP_SSID);
+    memcpy(wifi_config.ap.ssid, sensor_node_config.ssid, sensor_node_config.ssid_len);
+    wifi_config.ap.ssid_len = sensor_node_config.ssid_len;
+    strcpy(reinterpret_cast<char*>(wifi_config.ap.password), sensor_node_config.password);
     wifi_config.ap.max_connection = 3;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     
@@ -568,7 +624,7 @@ static void do_receiver_connecting()
     if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
 
     lcd.println("Starting receiver node...");
-    check_fatal(receiver_node.start(SENSOR_NODE_PORT), "failed to start receiver node");
+    check_fatal(receiver_node.start(sensor_node_config.port), "failed to start receiver node");
 
     buttons.clear_events();
 
@@ -728,6 +784,195 @@ static void do_testing()
     }
 }
 
+
+const struct {
+    const char* name;
+    wifi_auth_mode_t mode;
+} AUTHMODES[] = {
+    {"OPEN",            wifi_auth_mode_t::WIFI_AUTH_OPEN},
+    {"WEP",             wifi_auth_mode_t::WIFI_AUTH_WEP},
+    {"WPA_PSK",         wifi_auth_mode_t::WIFI_AUTH_WPA_PSK},
+    {"WPA_WPA2_PSK",    wifi_auth_mode_t::WIFI_AUTH_WPA_WPA2_PSK},
+    {"WPA2_PSK",        wifi_auth_mode_t::WIFI_AUTH_WPA2_PSK},
+    {"WPA2_ENTERPRISE", wifi_auth_mode_t::WIFI_AUTH_WPA2_ENTERPRISE},
+};
+
+
+// index handler.
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[] asm("_binary_index_html_end");
+extern const char script_js_start[] asm("_binary_script_js_start");
+extern const char script_js_end[] asm("_binary_script_js_end");
+
+// config json handler
+static esp_err_t http_get_config_handler(httpd_req_t *req)
+{
+    char buffer[256] = {0};
+    char ssid[sizeof(sensor_node_config.ssid)+1];
+    const auto* authmode = &AUTHMODES[0];
+    for(const auto& candidate : AUTHMODES ) {
+        if( candidate.mode == sensor_node_config.auth_mode ) {
+            authmode = &candidate;
+        }
+    }
+    strncpy(ssid, sensor_node_config.ssid, sensor_node_config.ssid_len+1);
+    std::size_t response_length = snprintf(buffer, sizeof(buffer) - 1, "{\"ssid\":\"%s\",\"password\":\"%s\",\"name\":\"%s\",\"port\":%d,\"authmode\":\"%s\"}", ssid, sensor_node_config.password, sensor_node_config.name, sensor_node_config.port, authmode->name );
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buffer, response_length);
+    return ESP_OK;
+}
+
+static esp_err_t http_get_handler(httpd_req_t *req)
+{
+    if( strcmp(req->uri, "/") == 0 || strcmp(req->uri, "/index.html") == 0 ) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, index_html_start, index_html_end - index_html_start);
+    }
+    else if( strcmp(req->uri, "/script.js") == 0 ) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, script_js_start, script_js_end - script_js_start);
+    }
+    else if( strcmp(req->uri, "/config") == 0 ) {
+        return http_get_config_handler(req);
+    }
+    else {
+        httpd_resp_set_status(req, "404 NOT FOUND");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "", 0);
+    }
+
+    return ESP_OK;
+}
+static const httpd_uri_t uri_get = {
+    .uri = "/*",
+    .method = HTTP_GET,
+    .handler = http_get_handler,
+    .user_ctx = nullptr,
+};
+
+static esp_err_t http_config_handler(httpd_req_t *req)
+{
+    esp_err_t err;
+
+    struct Error {
+        bool success;
+        httpd_req_t* req;
+        Error(httpd_req_t* req) : success(false), req(req) {}
+        ~Error() { if(!success) { httpd_resp_send_500(req); } }
+    } error_handler(req);
+
+    if( req->content_len > 2048 ) {
+        ESP_LOGE(TAG, "request too long");
+        return ESP_OK;
+    }
+    std::vector<std::uint8_t> buffer(req->content_len);
+    httpd_req_recv(req, reinterpret_cast<char*>(buffer.data()), buffer.size());
+
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> json(cJSON_Parse(reinterpret_cast<char*>(buffer.data())), &cJSON_Delete);
+    if( !json ) { ESP_LOGE(TAG, "JSON parse error"); return ESP_OK; }
+    
+    auto ssid = cJSON_GetObjectItem(json.get(), "ssid");
+    if( ssid == nullptr || !cJSON_IsString(ssid)) { ESP_LOGE(TAG, "Invalid ssid field type"); return ESP_OK;}
+    auto password = cJSON_GetObjectItem(json.get(), "password");
+    if( password != nullptr && !(cJSON_IsString(password) || cJSON_IsNull(password))) { ESP_LOGE(TAG, "Invalid password field type"); return ESP_OK;}
+    auto authmode = cJSON_GetObjectItem(json.get(), "authmode");
+    if( authmode == nullptr || !cJSON_IsString(authmode)) { ESP_LOGE(TAG, "Invalid authmode field type"); return ESP_OK;}
+
+    auto ssid_len = strnlen(ssid->valuestring, sizeof(sensor_node_config.ssid));
+    memcpy(sensor_node_config.ssid, ssid->valuestring, ssid_len);
+    if( password == nullptr || cJSON_IsNull(password) ) {
+        sensor_node_config.password[0] = 0;
+    }
+    else {
+        strncpy(sensor_node_config.password, password->valuestring, sizeof(sensor_node_config.password));
+    }
+    sensor_node_config.ssid_len = ssid_len;
+    
+    bool authmode_found = false;
+    for(const auto& candidate : AUTHMODES) {
+        if( strcmp(authmode->valuestring, candidate.name) == 0 ) {
+            sensor_node_config.auth_mode = candidate.mode;
+            authmode_found = true;
+            break;
+        }
+    }
+    if( !authmode_found ) { ESP_LOGE(TAG, "Invalid authmode"); return ESP_OK;}
+
+    ESP_LOGI(TAG, "configuration updated via Web interface.");
+    nvs_handle handle;
+    if( (err = nvs_open("sensor_node", NVS_READWRITE, &handle)) == ESP_OK) {
+        size_t size = sizeof(sensor_node_config);
+        if( nvs_set_blob(handle, "config", &sensor_node_config, size) == ESP_OK ) {
+            if( nvs_commit(handle) == ESP_OK ) {
+                ESP_LOGI(TAG, "configuration stored to NVS successfully.");
+            }
+        }
+        nvs_close(handle);
+    }
+    else {
+        ESP_LOGE(TAG, "Failed to open NVS - %d", err);
+    }
+
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_send(req, "OK", 2);
+    error_handler.success = true;
+    return ESP_OK;
+}
+static const httpd_uri_t uri_post_config = {
+    .uri = "/config",
+    .method = HTTP_POST,
+    .handler = http_config_handler,
+    .user_ctx = nullptr,
+};
+static void do_set_access_point(void)
+{
+    // Initialize Wi-Fi as AP+STA mode.
+    if( check_fatal(esp_wifi_set_mode(WIFI_MODE_AP), "failed to initialize Wi-Fi (APSTA)") ) return;
+    if( check_fatal(esp_wifi_set_protocol(ESP_IF_WIFI_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N), "failed to initialize Wi-Fi (AP, protocol)") ) return;
+    
+    std::uint8_t mac_address[6];
+    if( check_fatal( esp_wifi_get_mac(WIFI_IF_AP, mac_address), "Failed to get MAC address") ) return;
+    
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    wifi_config.ap.ssid_len = snprintf(reinterpret_cast<char*>(wifi_config.ap.ssid), sizeof(wifi_config.ap.ssid), "esp-sn-%02x%02x%02x%02x%02x%02x", mac_address[0], mac_address[1], mac_address[2], mac_address[3], mac_address[4], mac_address[5]);
+    wifi_config.ap.max_connection = 4;
+    wifi_config.ap.beacon_interval = 100;
+    
+    if( check_fatal(esp_wifi_set_config(WIFI_IF_AP, &wifi_config), "failed to set Wi-Fi config (AP)") ) return;
+    wifi_sta_ap_started.clear();
+    if( check_fatal(esp_wifi_start(), "failed to initialize Wi-Fi (start)") ) return;
+    
+    // Start HTTP server
+    httpd_handle_t http_server = nullptr;
+    {
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.uri_match_fn = httpd_uri_match_wildcard;
+        if( check_fatal(httpd_start(&http_server, &config), "failed to start HTTP server")) return;
+        if( check_fatal(httpd_register_uri_handler(http_server, &uri_get), "failed to register HTTP server URI handler (get)") ) return;
+        if( check_fatal(httpd_register_uri_handler(http_server, &uri_post_config), "failed to register HTTP server URI handler (post)") ) return;
+    }
+
+    lcd.fillScreen(0);
+    lcd.setCursor(0, 0);
+    lcd.setTextColor(lcd.color565(255, 255, 255));
+    lcd.printf("Starting Wi-Fi AP as SSID %s", wifi_config.ap.ssid);
+
+    buttons.clear_events();
+    while(true) {        
+        if( auto event = buttons.read_event(freertos::to_ticks(std::chrono::milliseconds(10))) ) {
+            if( event.value.type == Button::EventType::Pushed ) {
+                if( event.value.position == Button::Position::A ) {
+                    // Restart when button A is pressed.
+                    esp_restart();
+                }
+            }
+        }
+    }
+}
+
 #define TAG "MAIN"
 extern "C" void app_main(void)
 {
@@ -829,6 +1074,10 @@ extern "C" void app_main(void)
         
         case MainState::Testing:
             do_testing();
+            break;
+        
+        case MainState::SetAccessPoint:
+            do_set_access_point();
             break;
         default:
             fatal_error("Unknown state - %d", main_state);

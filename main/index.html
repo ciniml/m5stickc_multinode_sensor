@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>ESP32 Multi Node Sensor Configuration</title>
+</head>
+
+<body>
+    <script src="script.js"></script>
+    <h1>ESP32 Multi Node Sensor Configuration</h1>
+    <div>
+        <form id="config_form">
+            <p><label>SSID:<input type="text" name="ssid" maxlength="32"/></label></p>
+            <p><label>Password:<input type="password" name="password" maxlength="63"/></label></p>
+            <p>
+                <label>Authentication:
+                    <select name="authmode">
+                        <option value="OPEN">None</option>
+                        <option value="WPA_PSK">WPA-PSK</option>
+                        <option value="WPA2_PSK">WPA2-PSK</option>
+                        <option value="WPA_WPA2_PSK">WPA/WPA2-PSK</option>
+                        <option value="WPA2_ENTERPRISE">WPA2-ENTERPRISE</option>
+                    </select>
+                </label>
+            </p>
+            <input type="submit" value="Apply" onclick="applyConfig(); return false;" />
+        </form>
+        <div id="error_message"></div>
+    </div>
+</body>
+</html>
