@@ -13,3 +13,6 @@
 [submodule "main/bmm150"]
 	path = main/bmm150
 	url = https://github.com/BoschSensortec/BMM150-Sensor-API.git
+[submodule "components/LovyanGFX"]
+	path = components/LovyanGFX
+	url = https://github.com/lovyan03/LovyanGFX
