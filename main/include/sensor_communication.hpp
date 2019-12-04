@@ -79,7 +79,7 @@ struct SensorCommunication
 
     static void udp_recv_handler(void* arg, udp_pcb* pcb, pbuf* p, const ip_addr_t* addr, std::uint16_t port)
     {
-        ESP_LOGV(TAG, "Packet received from " IPSTR " port %d", IP2STR(*addr), port);
+        ESP_LOGD(TAG, "Packet received from " IPSTR " port %d", IP2STR(*addr), port);
         auto this_ = reinterpret_cast<SensorCommunication*>(arg);
         if( this_ != nullptr && this_->port == port ) {
             if( this_->received_packet_queue.send({p, SensorNodeAddress(addr), port, this_->clock.now()} , freertos::Ticks::zero()) ) {

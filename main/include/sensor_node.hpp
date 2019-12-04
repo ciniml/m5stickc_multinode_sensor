@@ -149,7 +149,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     {
         auto timestamp = get_timestamp();
         auto adjusted_timestamp = this->get_adjusted_timestamp();
-        ESP_LOGI(TAG, "ESP-NOW received from " MACSTR, MAC2STR(mac_addr));
+        ESP_LOGD(TAG, "ESP-NOW received from " MACSTR, MAC2STR(mac_addr));
 
         if( data_len >= SensorNodePacket::HEADER_SIZE ) {
             auto packet = reinterpret_cast<const SensorNodePacket*>(data);
@@ -158,7 +158,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
                 ESP_LOGI(TAG, "ESP-NOW invalid packet %d", static_cast<std::uint8_t>(validate_result.error_code));
                 return;
             }
-            ESP_LOGI(TAG, "ESP-NOW received %d from " MACSTR, static_cast<std::uint8_t>(packet->type), MAC2STR(mac_addr));
+            ESP_LOGD(TAG, "ESP-NOW received %d from " MACSTR, static_cast<std::uint8_t>(packet->type), MAC2STR(mac_addr));
 
             this->ensure_esp_now_peer_exist(mac_address);
             
@@ -298,7 +298,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     }
     Result<void, esp_err_t> start(const SensorNodeAddress& address, std::uint16_t port, const std::uint8_t* mac_address, const char* name, freertos::WaitEvent* measurement_requested_event)
     {
-        ESP_LOGI(TAG, "Starting Sensor node receiver addr:" IPSTR " port:%d", IP2STR(address.ip_address), port);
+        ESP_LOGI(TAG, "Starting Sensor node addr:" IPSTR " port:%d", IP2STR(address.ip_address), port);
         memcpy(this->mac_address, mac_address, 6);
         strcpy(reinterpret_cast<char*>(this->name), name);
         this->address = address;
