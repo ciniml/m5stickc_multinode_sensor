@@ -22,7 +22,7 @@
 
 #include <cJSON.h>
 
-#include <M5Display.h>
+#include <LovyanGFX.hpp>
 
 #include <freertos_util.hpp>
 #include <result.hpp>
@@ -61,7 +61,20 @@ static constexpr const SensorNodeConfig DefaultConfig = {
 
 static SensorNodeConfig sensor_node_config = DefaultConfig;
 
-static M5Display lcd;
+struct LGFX_Config {
+    static constexpr spi_host_device_t spi_host = VSPI_HOST;
+    static constexpr int spi_mosi = 15;
+    static constexpr int spi_miso = 14;
+    static constexpr int spi_sclk = 13;
+    static constexpr int spi_cs   =  5;
+    static constexpr int spi_dc   = 23;
+    static constexpr int panel_rst = 18;
+    static constexpr int freq_write = 27000000;
+    static constexpr int freq_read  = 16000000;
+    static constexpr int freq_fill  = 27000000;
+    static constexpr bool spi_half_duplex = true;
+};
+static LovyanGFX<lgfx::Esp32Spi<lgfx::Panel_ST7735_GREENTAB160x80, LGFX_Config> > lcd;
 
 static I2CMaster i2c_internal(I2C_NUM_1);
 static I2CMaster i2c_external(I2C_NUM_0);
@@ -1045,7 +1058,8 @@ extern "C" void app_main(void)
     }
 
     // Initializing LCD
-    lcd.begin();
+    lcd.init();
+    lcd.invertDisplay(true);
     lcd.setRotation(3);
     
     while(true) {

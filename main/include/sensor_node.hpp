@@ -8,6 +8,7 @@
 #include <vector>
 #include <chrono>
 #include <numeric>
+#include <algorithm>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>

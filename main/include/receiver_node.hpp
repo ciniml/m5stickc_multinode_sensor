@@ -9,6 +9,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <numeric>
+#include <algorithm>
 
 #include <esp_err.h>
 #include <esp_system.h>
