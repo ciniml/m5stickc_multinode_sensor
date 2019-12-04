@@ -118,6 +118,8 @@ public:
         : state(State::NotStarted)
         , imu(i2c_internal, 0x68)
         , magnetometer(external_i2c, 0x10)
+        , timestamp_at_interrupt(0)
+        , measurement_start_time(0)
         , battery_voltage(0)
         , battery_charge_current(0)
         , battery_discharge_current(0)
@@ -210,8 +212,12 @@ public:
             imu.clear_sensor_data();
             ESP_LOGI(TAG, "IMU initialization completed.");
 
-            freertos::Task::notify_wait(0, NOTIFY_BIT_START_MEASUREMENT, freertos::MAX_DELAY);
-
+            while( auto notify_result = freertos::Task::notify_wait(0, NOTIFY_BIT_START_MEASUREMENT, freertos::MAX_DELAY) ) {
+                if( notify_result.value & NOTIFY_BIT_START_MEASUREMENT ) {
+                    break;
+                }
+            }
+            
             while( this->measurement_start_time - get_timestamp() >= std::chrono::seconds(2) ) {
                 freertos::Task::delay_ms(1);
             }
@@ -1011,7 +1017,7 @@ extern "C" void app_main(void)
     //         auto result = commands.start()
     //             .then([&commands, device_address](){ return commands.write_byte((device_address << 1) | 0, true); })
     //             .then([&commands](){ return commands.stop(); })
-    //             .then([&commands](){ return i2c_external.execute(commands, pdMS_TO_TICKS(50)); });
+    //             .then([&commands](){ return i2c_external.execute(commands, freertos::to_ticks(std::chrono::milliseconds(10))); });
     //         if( result.is_success ) {
     //             ESP_LOGI(TAG, "Address %02x: OK", device_address);
     //         }
