@@ -121,6 +121,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
                  , measurement_requested_event(nullptr)
                 {}
 
+    
     bool is_connected() const { return this->state == State::Connected; }
     std::chrono::microseconds get_adjusted_timestamp() const
     {
@@ -301,7 +302,7 @@ struct SensorNode : public freertos::StaticTask<8192, SensorNode>
     {
         ESP_LOGI(TAG, "Starting Sensor node addr:" IPSTR " port:%d", IP2STR(address.ip_address), port);
         memcpy(this->mac_address, mac_address, 6);
-        strcpy(reinterpret_cast<char*>(this->name), name);
+        strncpy(reinterpret_cast<char*>(this->name), name, sizeof(this->name)-1);
         this->address = address;
         this->port = port;
 

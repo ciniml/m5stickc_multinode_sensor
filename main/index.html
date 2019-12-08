@@ -8,8 +8,12 @@
 <body>
     <script src="script.js"></script>
     <h1>ESP32 Multi Node Sensor Configuration</h1>
-    <div>
+    <div id="loading">
+        <p>Loading...</p>
+    </div>
+    <div id="config_form_container" style="visibility: collapse;">
         <form id="config_form">
+            <p><label>Unit name:<input type="text" name="name" maxlength="31"/></label></p>
             <p><label>SSID:<input type="text" name="ssid" maxlength="32"/></label></p>
             <p><label>Password:<input type="password" name="password" maxlength="63"/></label></p>
             <p>
