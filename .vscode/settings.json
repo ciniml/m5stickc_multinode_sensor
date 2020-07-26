@@ -1,6 +1,7 @@
 {
     "cmake.configureOnOpen": false,
     "files.associations": {
+        "*.v": "systemverilog",
         "type_traits": "cpp",
         "array": "cpp",
         "atomic": "cpp",
@@ -61,7 +62,10 @@
         "numeric": "cpp",
         "esp_event_legacy.h": "c",
         "esp_event_loop.h": "c",
-        "esp_event.h": "c"
+        "esp_event.h": "c",
+        "random": "cpp",
+        "esp_err.h": "c",
+        "glcdfont.c": "cpp"
     },
     "C_Cpp.errorSquiggles": "Disabled"
 }
